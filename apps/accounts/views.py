@@ -14,6 +14,7 @@ from .permissions import IsAdminRole
 from .serializers import (
     ForgotPasswordSerializer,
     OTPLoginSerializer,
+    RegistrationRequestReviewSerializer,
     RegistrationRequestSerializer,
     ResendOTPSerializer,
     ResetPasswordConfirmSerializer,
@@ -21,10 +22,31 @@ from .serializers import (
 )
 
 
-class RegistrationRequestCreateView(generics.CreateAPIView):
+class RegistrationRequestListCreateView(generics.ListCreateAPIView):
+    queryset = RegistrationRequest.objects.all().order_by('-created_at')
+
+    def get_permissions(self):
+        if self.request.method == 'POST':
+            return [AllowAny()]
+        return [IsAuthenticated(), IsAdminRole()]
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return RegistrationRequestSerializer
+        return RegistrationRequestReviewSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        return queryset
+
+
+class RegistrationRequestDetailView(generics.RetrieveAPIView):
     queryset = RegistrationRequest.objects.all()
-    serializer_class = RegistrationRequestSerializer
-    permission_classes = [AllowAny]
+    serializer_class = RegistrationRequestReviewSerializer
+    permission_classes = [IsAuthenticated, IsAdminRole]
 
 
 class RegistrationRequestApproveView(APIView):

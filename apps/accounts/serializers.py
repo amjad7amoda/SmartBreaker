@@ -20,6 +20,18 @@ class RegistrationRequestSerializer(serializers.ModelSerializer):
         return value
 
 
+class RegistrationRequestReviewSerializer(serializers.ModelSerializer):
+    reviewed_by = serializers.EmailField(source='reviewed_by.email', read_only=True, default=None)
+
+    class Meta:
+        model = RegistrationRequest
+        fields = (
+            'id', 'email', 'phone', 'role', 'status',
+            'reviewed_by', 'reviewed_at', 'created_at',
+        )
+        read_only_fields = fields
+
+
 class OTPLoginSerializer(serializers.Serializer):
     email = serializers.EmailField()
     otp = serializers.CharField()

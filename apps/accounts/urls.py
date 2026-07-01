@@ -4,7 +4,8 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from . import views
 
 urlpatterns = [
-    path('requests/', views.RegistrationRequestCreateView.as_view(), name='registration-request-create'),
+    path('requests/', views.RegistrationRequestListCreateView.as_view(), name='registration-request-list-create'),
+    path('requests/<int:pk>/', views.RegistrationRequestDetailView.as_view(), name='registration-request-detail'),
     path('requests/<int:pk>/approve/', views.RegistrationRequestApproveView.as_view(), name='registration-request-approve'),
     path('requests/<int:pk>/deny/', views.RegistrationRequestDenyView.as_view(), name='registration-request-deny'),
     path('otp-login/', views.OTPLoginView.as_view(), name='otp-login'),

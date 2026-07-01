@@ -19,16 +19,16 @@ class RegistrationApprovalFlowTests(TestCase):
 
     def test_request_creation_rejects_duplicate_email(self):
         User.objects.create_user(email='existing@example.com', role='home_user')
-        resp = self.client.post(reverse('registration-request-create'), {
+        resp = self.client.post(reverse('registration-request-list-create'), {
             'email': 'existing@example.com', 'phone': '1', 'role': 'home_user',
         })
         self.assertEqual(resp.status_code, 400)
 
     def test_request_creation_rejects_duplicate_pending(self):
-        self.client.post(reverse('registration-request-create'), {
+        self.client.post(reverse('registration-request-list-create'), {
             'email': 'dup@example.com', 'phone': '1', 'role': 'home_user',
         })
-        resp = self.client.post(reverse('registration-request-create'), {
+        resp = self.client.post(reverse('registration-request-list-create'), {
             'email': 'dup@example.com', 'phone': '1', 'role': 'home_user',
         })
         self.assertEqual(resp.status_code, 400)
@@ -48,7 +48,7 @@ class RegistrationApprovalFlowTests(TestCase):
         self.assertEqual(resp.status_code, 403)
 
     def test_full_approve_otp_login_set_password_flow(self):
-        self.client.post(reverse('registration-request-create'), {
+        self.client.post(reverse('registration-request-list-create'), {
             'email': 'newuser@example.com', 'phone': '123', 'role': 'home_user',
         })
         req = RegistrationRequest.objects.get(email='newuser@example.com')
@@ -86,7 +86,7 @@ class RegistrationApprovalFlowTests(TestCase):
         self.assertEqual(reuse_otp.status_code, 400)
 
     def test_resend_otp_lets_stuck_user_recover_and_invalidates_old_otp(self):
-        self.client.post(reverse('registration-request-create'), {
+        self.client.post(reverse('registration-request-list-create'), {
             'email': 'stuck@example.com', 'phone': '123', 'role': 'home_user',
         })
         req = RegistrationRequest.objects.get(email='stuck@example.com')
@@ -112,7 +112,7 @@ class RegistrationApprovalFlowTests(TestCase):
         self.assertEqual(new_otp_login.status_code, 200)
 
     def test_resend_otp_cooldown_blocks_rapid_repeat_requests(self):
-        self.client.post(reverse('registration-request-create'), {
+        self.client.post(reverse('registration-request-list-create'), {
             'email': 'rapid@example.com', 'phone': '123', 'role': 'home_user',
         })
         req = RegistrationRequest.objects.get(email='rapid@example.com')
@@ -139,7 +139,7 @@ class RegistrationApprovalFlowTests(TestCase):
         self.assertEqual(len(mail.outbox), 0)
 
     def test_deny_flow_sends_email_and_blocks_login(self):
-        self.client.post(reverse('registration-request-create'), {
+        self.client.post(reverse('registration-request-list-create'), {
             'email': 'denyme@example.com', 'phone': '1', 'role': 'technician',
         })
         req = RegistrationRequest.objects.get(email='denyme@example.com')
@@ -149,6 +149,50 @@ class RegistrationApprovalFlowTests(TestCase):
         self.assertEqual(RegistrationRequest.objects.get(id=req.id).status, 'denied')
         self.assertFalse(User.objects.filter(email='denyme@example.com').exists())
         self.assertEqual(len(mail.outbox), 1)
+
+    def test_admin_can_list_and_filter_requests(self):
+        self.client.post(reverse('registration-request-list-create'), {
+            'email': 'pending1@example.com', 'phone': '1', 'role': 'home_user',
+        })
+        self.client.post(reverse('registration-request-list-create'), {
+            'email': 'pending2@example.com', 'phone': '1', 'role': 'technician',
+        })
+        approved_req_id = RegistrationRequest.objects.get(email='pending1@example.com').id
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(reverse('registration-request-approve', args=[approved_req_id]), {}, **self.admin_auth)
+
+        resp = self.client.get(reverse('registration-request-list-create'), **self.admin_auth)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()), 2)
+
+        pending_resp = self.client.get(
+            reverse('registration-request-list-create'), {'status': 'pending'}, **self.admin_auth
+        )
+        emails = {item['email'] for item in pending_resp.json()}
+        self.assertEqual(emails, {'pending2@example.com'})
+
+        detail_resp = self.client.get(
+            reverse('registration-request-detail', args=[approved_req_id]), **self.admin_auth
+        )
+        self.assertEqual(detail_resp.status_code, 200)
+        self.assertEqual(detail_resp.json()['status'], 'approved')
+        self.assertEqual(detail_resp.json()['reviewed_by'], 'admin@example.com')
+
+    def test_non_admin_cannot_list_requests(self):
+        user = User.objects.create_user(email='plain2@example.com', role='home_user', password='x')
+        user.is_active = True
+        user.must_set_password = False
+        user.save()
+        login = self.client.post(reverse('login'), {'email': 'plain2@example.com', 'password': 'x'})
+        access = login.json()['access']
+        resp = self.client.get(
+            reverse('registration-request-list-create'), HTTP_AUTHORIZATION=f'Bearer {access}'
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_anonymous_cannot_list_requests(self):
+        resp = self.client.get(reverse('registration-request-list-create'))
+        self.assertEqual(resp.status_code, 401)
 
 
 @override_settings(

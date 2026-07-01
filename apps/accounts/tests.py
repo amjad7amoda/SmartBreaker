@@ -1,8 +1,14 @@
+import re
+
 from django.core import mail
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from .models import RegistrationRequest, User
+
+
+def _extract_code(body):
+    return re.search(r'\b(\d{6})\b', body).group(1)
 
 
 @override_settings(
@@ -60,7 +66,7 @@ class RegistrationApprovalFlowTests(TestCase):
         self.assertEqual(approve_resp.status_code, 200)
         self.assertEqual(len(mail.outbox), 1)
 
-        otp = mail.outbox[0].body.split('log in:')[1].splitlines()[0].strip()
+        otp = _extract_code(mail.outbox[0].body)
 
         early_login = self.client.post(reverse('login'), {'email': 'newuser@example.com', 'password': 'whatever'})
         self.assertEqual(early_login.status_code, 401)
@@ -92,7 +98,7 @@ class RegistrationApprovalFlowTests(TestCase):
         req = RegistrationRequest.objects.get(email='stuck@example.com')
         with self.captureOnCommitCallbacks(execute=True):
             self.client.post(reverse('registration-request-approve', args=[req.id]), {}, **self.admin_auth)
-        old_otp = mail.outbox[0].body.split('log in:')[1].splitlines()[0].strip()
+        old_otp = _extract_code(mail.outbox[0].body)
 
         from django.utils import timezone
         stuck_user = User.objects.get(email='stuck@example.com')
@@ -103,7 +109,7 @@ class RegistrationApprovalFlowTests(TestCase):
             resend_resp = self.client.post(reverse('resend-otp'), {'email': 'stuck@example.com'})
         self.assertEqual(resend_resp.status_code, 200)
         self.assertEqual(len(mail.outbox), 2)
-        new_otp = mail.outbox[1].body.split('log in:')[1].splitlines()[0].strip()
+        new_otp = _extract_code(mail.outbox[1].body)
 
         old_otp_login = self.client.post(reverse('otp-login'), {'email': 'stuck@example.com', 'otp': old_otp})
         self.assertEqual(old_otp_login.status_code, 400)
@@ -216,7 +222,7 @@ class ForgotPasswordFlowTests(TestCase):
         resp = self._request_code()
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(mail.outbox), 1)
-        code = mail.outbox[0].body.split('reset your password:')[1].splitlines()[0].strip()
+        code = _extract_code(mail.outbox[0].body)
 
         confirm = self.client.post(reverse('reset-password'), {
             'email': 'active@example.com', 'code': code,
@@ -238,7 +244,7 @@ class ForgotPasswordFlowTests(TestCase):
 
     def test_reset_password_rejects_mismatched_confirmation(self):
         self._request_code()
-        code = mail.outbox[0].body.split('reset your password:')[1].splitlines()[0].strip()
+        code = _extract_code(mail.outbox[0].body)
         resp = self.client.post(reverse('reset-password'), {
             'email': 'active@example.com', 'code': code,
             'new_password': 'BrandNewPass123!', 'new_password_confirm': 'Different123!',

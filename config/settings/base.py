@@ -38,9 +38,7 @@ INSTALLED_APPS = [
     
     # Local apps
     'apps.accounts',
-    'apps.breakers',
-    'apps.monitoring',
-    'apps.notifications',
+    'apps.organizations',
 ]
 
 MIDDLEWARE = [

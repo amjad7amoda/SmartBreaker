@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartBreaker Simulator</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>SmartBreaker Simulator</h1>
+  <div class="subtitle">Solar site simulator for testing the KBS — PV model driven by real NASA POWER climatology (data/solar_data.csv)</div>
+</header>
+
+<main>
+  <!-- ======================= TIME ======================= -->
+  <section class="panel" id="panel-time">
+    <h2>Simulated time</h2>
+    <div class="row">
+      <label>Date &amp; time
+        <input type="datetime-local" id="inp-datetime" step="1">
+      </label>
+      <label>Milliseconds
+        <input type="number" id="inp-ms" min="0" max="999" value="0">
+      </label>
+      <label>Time scale (sim s per real s)
+        <input type="number" id="inp-scale" min="0.1" max="86400" step="0.1" value="60">
+      </label>
+      <button id="btn-playpause" class="primary">Pause</button>
+    </div>
+    <div class="row readout-row">
+      <div class="readout">Sim clock: <span id="out-simclock">–</span></div>
+      <div class="readout">Day/night: <span id="out-daynight">–</span></div>
+      <div class="readout">Sunrise–sunset: <span id="out-sunwindow">–</span></div>
+    </div>
+  </section>
+
+  <!-- ======================= LOCATION / WEATHER ======================= -->
+  <section class="panel" id="panel-location">
+    <h2>Location, season &amp; weather</h2>
+    <div class="row">
+      <label>City
+        <select id="inp-city"></select>
+      </label>
+      <label>Season <span class="hint">(auto-corrects from datetime)</span>
+        <select id="inp-season">
+          <option value="winter">winter</option>
+          <option value="summer">summer</option>
+        </select>
+      </label>
+      <label>Weather
+        <select id="inp-weather"></select>
+      </label>
+      <label class="check"><input type="checkbox" id="inp-weather-auto" checked> auto weather (from real climate data)</label>
+    </div>
+    <div class="row readout-row">
+      <div class="readout">Month climate: <span id="out-climate">–</span></div>
+    </div>
+  </section>
+
+  <!-- ======================= PV / INVERTER / BATTERY ======================= -->
+  <section class="panel" id="panel-power">
+    <h2>PV, inverter &amp; battery</h2>
+    <div class="row">
+      <label>Max PV production (W)
+        <input type="number" id="inp-maxpv" min="0" step="50" value="4000">
+      </label>
+      <label>PV use threshold (W) <span class="hint">inverter uses PV above this</span>
+        <input type="number" id="inp-pvthreshold" min="0" step="10" value="80">
+      </label>
+      <label>Inverter max power (W)
+        <input type="number" id="inp-maxinv" min="100" step="100" value="4000">
+      </label>
+      <label class="check"><input type="checkbox" id="inp-grid-available" checked> grid electricity available <span class="hint">(off = state-grid outage)</span></label>
+    </div>
+    <div class="row">
+      <label>Battery capacity (Wh)
+        <input type="number" id="inp-batcap" min="100" step="100" value="5000">
+      </label>
+      <label>Battery charge (%)
+        <input type="number" id="inp-batsoc" min="0" max="100" step="1" value="60">
+      </label>
+      <label>Battery nominal voltage (V)
+        <select id="inp-batnom">
+          <option value="12">12</option>
+          <option value="24" selected>24</option>
+          <option value="48">48</option>
+        </select>
+      </label>
+    </div>
+    <div class="pv-visual">
+      <canvas id="pv-chart" width="820" height="200"></canvas>
+    </div>
+    <div class="row readout-row">
+      <div class="readout big">PV now: <span id="out-pv">0</span> W</div>
+      <div class="readout big">Load: <span id="out-load">0</span> W</div>
+      <div class="readout big">Battery: <span id="out-soc">–</span></div>
+      <div class="readout big">Source: <span id="out-source">–</span></div>
+    </div>
+  </section>
+
+  <!-- ======================= BREAKERS ======================= -->
+  <section class="panel" id="panel-breakers">
+    <h2>Breakers <button id="btn-add-breaker">+ add breaker</button></h2>
+    <table id="tbl-breakers">
+      <thead>
+        <tr>
+          <th>device id</th><th>priority</th><th>degree</th><th>load type</th>
+          <th>peak (W)</th><th>normal (W)</th><th>peak time (min)</th>
+          <th>switch</th><th>online</th><th>fault</th><th>draw now</th><th></th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- ======================= INVERTER READING ======================= -->
+  <section class="panel" id="panel-reading">
+    <h2>Inverter reading (what the Pi would send)</h2>
+    <pre id="out-reading">–</pre>
+  </section>
+
+  <!-- ======================= BACKEND PUSH ======================= -->
+  <section class="panel" id="panel-push">
+    <h2>Push to KBS backend</h2>
+    <div class="row">
+      <label>Server base URL
+        <input type="text" id="inp-baseurl" value="http://127.0.0.1:8000" size="28">
+      </label>
+      <label>Organization id
+        <input type="number" id="inp-orgid" min="1" value="1">
+      </label>
+      <label>Push every (real s)
+        <input type="number" id="inp-pushint" min="1" value="5">
+      </label>
+      <label class="check"><input type="checkbox" id="inp-push-enabled"> enabled</label>
+    </div>
+    <div class="row readout-row">
+      <div class="readout">Status: <span id="out-push">off</span></div>
+    </div>
+  </section>
+
+  <!-- ======================= KBS CONTROL ======================= -->
+  <section class="panel" id="panel-kbs">
+    <h2>KBS control</h2>
+    <div class="row">
+      <label class="check"><input type="checkbox" id="inp-kbs-connected"> connected — the KBS drives the breakers</label>
+      <label>K: act every (real s)
+        <input type="number" id="inp-kbs-k" min="5" step="5" value="60">
+      </label>
+      <label class="check"><input type="checkbox" id="inp-kbs-powersaving"> power saving</label>
+      <label>Battery floor (V) <span class="hint">countdown protection triggers near this</span>
+        <input type="number" id="inp-kbs-batfloor" min="0" step="0.1" value="24.0">
+      </label>
+      <label>Engine mode
+        <select id="inp-kbs-mode">
+          <option value="active" selected>active</option>
+          <option value="observing">observing</option>
+        </select>
+      </label>
+    </div>
+    <div class="row readout-row">
+      <div class="readout">KBS: <span id="out-kbs-status">disconnected</span></div>
+      <div class="readout">Last branch: <span id="out-kbs-branch">–</span></div>
+    </div>
+    <div id="kbs-log"></div>
+  </section>
+</main>
+
+<script src="data.js"></script>
+<script src="sim.js"></script>
+</body>
+</html>

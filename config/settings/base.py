@@ -39,6 +39,8 @@ INSTALLED_APPS = [
     # Local apps
     'apps.accounts',
     'apps.organizations',
+    'apps.breakers',
+    'apps.telemetry',
 ]
 
 MIDDLEWARE = [

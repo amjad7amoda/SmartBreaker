@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     'apps.organizations',
     'apps.breakers',
     'apps.telemetry',
+    'apps.kbs',
 ]
 
 MIDDLEWARE = [
@@ -111,7 +112,7 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # https://docs.djangoproject.com/en/6.0/topics/i18n/
 LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Asia/Damascus'  # site-local wall clock: schedule windows, day_start/day_end and the KBS day/night logic all read in this zone (storage stays UTC)
 USE_I18N = True
 USE_TZ = True
 
@@ -151,3 +152,12 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TASK_ALWAYS_EAGER = os.getenv('CELERY_TASK_ALWAYS_EAGER', 'False') == 'True'
+
+CELERY_BEAT_SCHEDULE = {
+    # KBS dispatcher: checks every minute which sites' cycle period (K,
+    # KBSSettings.cycle_seconds) has elapsed and queues their decision cycle.
+    'kbs-dispatch': {
+        'task': 'apps.kbs.tasks.run_kbs_cycles',
+        'schedule': 60.0,  # dispatcher period (s)
+    },
+}

@@ -35,7 +35,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
     'corsheaders',
-    
+
     # Local apps
     'apps.accounts',
     'apps.organizations',
@@ -136,14 +136,22 @@ SIMPLE_JWT = {
     'ROTATE_REFRESH_TOKENS': True,
 }
 
-DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'no-reply@smartbreaker.local')
-
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
-EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
+EMAIL_HOST = os.getenv('EMAIL_HOST') or 'smtp.gmail.com'
+EMAIL_PORT = int(os.getenv('EMAIL_PORT') or '587')
 EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER')
 EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD')
+
+# `or` rather than a getenv default: a blank var in .env must fall through too,
+# otherwise Django rejects '' as the sender address.
+DEFAULT_FROM_EMAIL = (
+    os.getenv('DEFAULT_FROM_EMAIL') or EMAIL_HOST_USER or 'no-reply@smartbreaker.local'
+)
 EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True') == 'True'
+
+# Encrypts third-party credentials (Tuya client_secret) at rest. Rotating this
+# key makes every stored secret unreadable — they must then be re-entered.
+TUYA_FERNET_KEY = os.getenv('TUYA_FERNET_KEY')
 
 CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
 CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')

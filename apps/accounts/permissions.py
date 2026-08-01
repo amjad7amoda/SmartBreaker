@@ -6,6 +6,15 @@ class IsAdminRole(BasePermission):
         return bool(request.user and request.user.is_authenticated and request.user.role == 'admin')
 
 
+class IsTechnicianOrAdmin(BasePermission):
+    def has_permission(self, request, view):
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and request.user.role in ('technician', 'admin')
+        )
+
+
 class IsPasswordSet(BasePermission):
     """Blocks access until the user has replaced their OTP-issued account with a real password."""
 

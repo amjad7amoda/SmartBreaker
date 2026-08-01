@@ -4,17 +4,7 @@ from apps.organizations.models import Organization
 
 
 class Breaker(models.Model):
-    """A smart breaker installed at a site, plus the KBS metadata attached to it.
 
-    Live electrical state lives in ``BreakerStatus`` (one row, overwritten on
-    every report); historical samples live in ``BreakerReading`` (time series,
-    used by the observing phase and sudden-draw detection).
-    """
-
-    # Importance category of the load behind this breaker. The KBS sheds in the
-    # order comfort -> normal and NEVER touches mandatory. 'ac_grid' marks the
-    # single special breaker that connects the site to state-grid electricity:
-    # switching it ON means "buy grid electricity".
     PRIORITY_TYPE_CHOICES = [
         ('mandatory', 'Mandatory'),  # must never be switched off by the KBS (servers, ...)
         ('normal', 'Normal'),        # may be shed when the system is stressed
@@ -59,31 +49,26 @@ class Breaker(models.Model):
 
 
 class BreakerStatus(models.Model):
-    """Latest live state reported for one breaker.
 
-    Exactly one row per breaker; every report from the edge overwrites it.
-    """
-
-    # What the relay does when mains power returns after an outage.
     RELAY_STATUS_CHOICES = [
-        ('power_off', 'Power Off'),  # relay comes back OFF after power loss
-        ('power_on', 'Power On'),    # relay comes back ON after power loss
-        ('last', 'Last'),            # relay restores its last position after power loss
+        ('power_off', 'Power Off'),
+        ('power_on', 'Power On'),
+        ('last', 'Last'),
     ]
 
-    breaker             = models.OneToOneField(Breaker, on_delete=models.CASCADE, related_name='status')  # the breaker this state belongs to
-    switch              = models.BooleanField(default=False)                                              # relay position: True = ON (load powered), False = OFF (flag)
-    countdown_1_s       = models.PositiveIntegerField(default=0)                                          # remaining time of the on-device flip timer; 0 = no timer armed (s)
-    cur_current_mA      = models.FloatField(null=True, blank=True)                                        # instantaneous current through the breaker (mA)
-    cur_power_mW        = models.FloatField(null=True, blank=True)                                        # instantaneous active power through the breaker (mW)
-    cur_voltage_mV      = models.FloatField(null=True, blank=True)                                        # instantaneous voltage at the breaker (mV)
-    fault               = models.CharField(max_length=100, blank=True, default='')                        # device fault flags (overheating / overvoltage / overcurrent ...); empty = healthy (text)
-    relay_status        = models.CharField(max_length=20, choices=RELAY_STATUS_CHOICES, default='last')   # power-recovery behaviour configured on the device (see choices)
-    child_lock          = models.BooleanField(default=False)                                              # True = physical buttons locked; remote control still works (flag)
-    cycle_time          = models.CharField(max_length=100, blank=True, default='')                        # raw on-device cycling-schedule string, stored as reported (text)
-    online              = models.BooleanField(default=False)                                              # True = breaker currently reachable on the network (flag)
-    last_switched_on_at = models.DateTimeField(null=True, blank=True)                                     # when switch last went OFF -> ON; motor loads draw peak until motor_peak_minutes after this (UTC timestamp)
-    reported_at         = models.DateTimeField(auto_now=True)                                             # when this state was last received (UTC timestamp)
+    breaker             = models.OneToOneField(Breaker, on_delete=models.CASCADE, related_name='status') 
+    switch              = models.BooleanField(default=False)                                             
+    countdown_1_s       = models.PositiveIntegerField(default=0)                                         
+    cur_current_mA      = models.FloatField(null=True, blank=True)                                       
+    cur_power_mW        = models.FloatField(null=True, blank=True)                                       
+    cur_voltage_mV      = models.FloatField(null=True, blank=True)                                       
+    fault               = models.CharField(max_length=100, blank=True, default='')                       
+    relay_status        = models.CharField(max_length=20, choices=RELAY_STATUS_CHOICES, default='last')  
+    child_lock          = models.BooleanField(default=False)                                             
+    cycle_time          = models.CharField(max_length=100, blank=True, default='')                       
+    online              = models.BooleanField(default=False)                                             
+    last_switched_on_at = models.DateTimeField(null=True, blank=True)                                    
+    reported_at         = models.DateTimeField(auto_now=True)                                            
 
     class Meta:
         verbose_name_plural = 'breaker statuses'
@@ -93,16 +78,11 @@ class BreakerStatus(models.Model):
 
 
 class BreakerReading(models.Model):
-    """One per-breaker consumption sample (time series).
 
-    Feeds the observing-phase learning (mean/peak load, average night usage)
-    and the night sudden-draw culprit detection.
-    """
-
-    breaker      = models.ForeignKey(Breaker, on_delete=models.CASCADE, related_name='readings')  # the breaker this sample belongs to
-    timestamp    = models.DateTimeField()                                                         # sample time as measured at the edge (UTC timestamp)
-    switch       = models.BooleanField()                                                          # relay position at sample time: True = ON (flag)
-    cur_power_mW = models.FloatField(null=True, blank=True)                                       # active power at sample time (mW)
+    breaker      = models.ForeignKey(Breaker, on_delete=models.CASCADE, related_name='readings')  
+    timestamp    = models.DateTimeField()                                                         
+    switch       = models.BooleanField()                                                          
+    cur_power_mW = models.FloatField(null=True, blank=True)                                       
 
     class Meta:
         ordering = ['-timestamp']

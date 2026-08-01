@@ -1,4 +1,4 @@
-"""Cycle orchestration: gather facts, decide, persist the outcome.
+"""Cycle orchestration: gather facts, run the rules, persist the outcome.
 
 The persisted ``BreakerAction`` rows are the engine's output — the new state
 the breakers must be switched to. The edge (Raspberry Pi) picks them up,
@@ -17,7 +17,8 @@ ACTION_DEDUPE_MINUTES = 10   # do not re-issue an identical command while one is
 from apps.breakers.models import Breaker
 
 from ..models import Alert, BreakerAction, KBSDecision, KBSSettings
-from .facts import facts_to_json, gather_facts
+from .facts import system_fact
+from .gathering import facts_to_json, gather_facts
 from .rules import decide
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ def run_cycle(organization, now=None):
 @transaction.atomic
 def _persist(organization, facts, result):
     """Store the decision, its switch commands, alerts, and lockouts (KBSDecision)."""
+    cycle_now = system_fact(facts)['now']  # the cycle time the decision was based on (UTC timestamp)
     decision = KBSDecision.objects.create(
         organization=organization,
         branch=result.branch,
@@ -81,7 +83,7 @@ def _persist(organization, facts, result):
             Breaker.objects.filter(id=intent.breaker_id).update(
                 locked_out=True,
                 lockout_reason=intent.reason,
-                locked_at=facts.now,
+                locked_at=cycle_now,
             )
     for alert in result.alerts:
         if Alert.objects.filter(

@@ -19,16 +19,6 @@ class WeatherContext:
 
 
 def get_weather_context(latitude_deg, longitude_deg, local_now):
-    """Build the weather context for one site.
-
-    latitude_deg:  site latitude; negative = southern hemisphere (degrees)
-    longitude_deg: site longitude (degrees)
-    local_now:     current local time at the site (datetime)
-    """
-    # TODO(weather-api): call the chosen external weather API here with the
-    # site coordinates and fill `condition`, `sunrise` and `sunset`. Until
-    # then the engine uses the configured day_start/day_end fallback and
-    # reports the condition as unknown.
     return WeatherContext(
         season=season_at(local_now.month, latitude_deg),
         condition=None,

@@ -59,10 +59,18 @@ class RunCycleView(APIView):
             return Response({'detail': 'unknown organization'}, status=status.HTTP_404_NOT_FOUND)
         decision = run_cycle(org)
         if decision is None:
-            return Response({'branch': None, 'detail': 'skipped (observing mode or no readings)'})
+            return Response({
+                'engine': 'apps.kbs.engine.run_cycle',
+                'branch': None,
+                'facts': None,
+                'actions': [],
+                'detail': 'skipped (observing mode or no readings)',
+            })
         return Response({
+            'engine': 'apps.kbs.engine.run_cycle',
             'branch': decision.branch,
             'created_at': decision.created_at,
+            'facts': decision.facts,
             'actions': [_action_dict(a) for a in decision.actions.select_related('breaker', 'decision')],
         })
 
@@ -94,7 +102,12 @@ class SimStateView(APIView):
         return Response({
             'settings': {f: getattr(kbs, f) for f in SETTINGS_EDITABLE_FIELDS},
             'latest_decision': (
-                {'branch': latest.branch, 'created_at': latest.created_at} if latest else None
+                {
+                    'engine': 'apps.kbs.engine.run_cycle',
+                    'branch': latest.branch,
+                    'created_at': latest.created_at,
+                    'facts': latest.facts,
+                } if latest else None
             ),
             'pending_actions': [_action_dict(a) for a in pending],
             'recent_alerts': [

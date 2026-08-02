@@ -127,6 +127,7 @@ class SystemFacts:
     heat_high: bool                  # heatsink temperature at/above the protection limit (flag)
     joule_deficit_J: float           # cumulative (load - PV) energy over the deficit window (J)
     deficit_high: bool               # joule deficit at/above the protection limit (flag)
+    overload: bool                   # current load at/above what the inverter can sustain -> shedding is the only real fix (flag)
 
     pv_power_W: float                # current PV production (W)
     pv_baseline_W: float | None      # recent PV baseline, latest sample excluded (W)
@@ -275,6 +276,7 @@ def gather_facts(organization, kbs, now=None):
         ),
         joule_deficit_J=deficit_J,
         deficit_high=deficit_J >= kbs.joule_deficit_limit_J,
+        overload=load_now_W >= kbs.max_inverter_power_W,
         pv_power_W=pv_now_W,
         pv_baseline_W=pv_baseline_W,
         sudden_pv_drop=is_sudden_drop(pv_now_W, pv_baseline_W, kbs.sudden_drop_fraction),

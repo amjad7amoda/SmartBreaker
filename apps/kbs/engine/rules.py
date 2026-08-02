@@ -6,7 +6,7 @@ database and no clock — everything it needs is inside the facts snapshot —
 so every branch is unit-testable with fabricated facts.
 
 Branch codes (returned in ``RuleResult.branch``):
-    protect_inverter                  heat/joule-deficit emergency shedding
+    protect_inverter.overload         current load exceeds the inverter rating -> shed by priority until it fits
     protect_battery                   battery near its voltage floor -> countdown shutdown
     day.surplus.comfort_on            PV covers the loads -> scheduled comfort ON
     day.battery_stable.comfort_on     battery above threshold -> scheduled comfort ON
@@ -22,6 +22,12 @@ Branch codes (returned in ``RuleResult.branch``):
     night.sudden_draw.battery_ok      reserve still covers mandatory until morning
     night.sudden_draw.trip            saving mode -> trip the culprit breaker
     night.sudden_draw.buy_grid        reserve short -> AC-grid breaker ON
+
+A heatsink over its limit without a live overload, or a joule deficit without
+one, do not get their own branch: they cannot be fixed by shedding (see
+``_protect_inverter_check``), so the cycle falls through to whichever branch
+above actually runs, carrying an ``inverter_protection`` alert if the
+heatsink is the cause.
 """
 
 from dataclasses import dataclass, field
@@ -65,21 +71,43 @@ def decide(facts):
 
     facts: the SystemFacts snapshot gathered for this cycle
     """
-    # Inverter protection outranks everything: high heatsink temperature or a
-    # high cumulative joule deficit means the hardware itself is at risk.
+    # High heatsink temperature or a high cumulative joule deficit both flag
+    # the inverter as stressed, but only a *live* overload (current draw at or
+    # above the rating) can actually be fixed by shedding load: the AC-grid
+    # breaker is the inverter's own input, not a separate feed to the loads,
+    # so every watt in or out already passes through it -- there is no way to
+    # "relieve" it other than reducing what it has to carry.
+    inverter_alert = None  # carried into whichever branch runs below, if any (AlertIntent | None)
     if facts.heat_high or facts.deficit_high:
-        return _protect_inverter(facts)
+        if facts.overload:
+            # A real overload is the one case that must not share this cycle
+            # with the day/night branch: shedding is the whole response, and
+            # nothing below should try to buy grid power or turn loads back on.
+            return _protect_inverter_overload(facts)
+        if facts.heat_high:
+            # Hot but not overloaded: likely a cooling/hardware fault, not a
+            # load problem. Shedding would not help, so just warn the user and
+            # let the cycle continue normally underneath the alert.
+            inverter_alert = _inverter_heat_alert(facts)
+        # else: joule deficit alone, without a live overload, is a trailing
+        # signal with nothing left to act on this instant -- the battery and
+        # day/night rules below already cover an ongoing energy shortfall.
+
     # Battery protection comes next: the bank must never reach its voltage
     # floor, so a graceful countdown shutdown is scheduled while it still can.
     if facts.battery_low:
-        return _protect_battery(facts)
-    if facts.is_daytime:
+        result = _protect_battery(facts)
+    elif facts.is_daytime:
         if facts.sudden_pv_drop:
             result = _daytime_sudden_drop(facts)
         else:
             result = _daytime_normal(facts)
     else:
         result = _night(facts)
+
+    if inverter_alert is not None:
+        result.alerts.insert(0, inverter_alert)
+
     # Whatever the branch decided, a running scheduled event gets its required
     # breakers switched ON (within head-room) — they are treated as mandatory.
     _ensure_event_required_on(facts, result)
@@ -90,28 +118,54 @@ def decide(facts):
 # branches
 # --------------------------------------------------------------------------
 
-def _protect_inverter(facts):
-    """Emergency shedding: switch off every non-mandatory load immediately.
+def _protect_inverter_overload(facts):
+    """Current load genuinely exceeds the inverter's rating: shed by priority
+    until it fits.
 
-    Mandatory breakers are never touched; the AC-grid breaker goes ON as the
-    last resort so the mandatory loads stay fed from the grid while the
-    inverter recovers.
+    The AC-grid breaker is deliberately left alone here: it is the inverter's
+    own AC input, not a separate supply line to the loads, so every watt
+    bought from the grid still passes through the same overloaded/overheated
+    unit. Switching it on would add current, not remove it. Shedding stops as
+    soon as the estimated remaining load is within the rating, so a mild
+    overload does not black out the whole site.
     """
-    result = RuleResult(branch='protect_inverter')
+    result = RuleResult(branch='protect_inverter.overload')
+    remaining_W = facts.load_power_W  # estimated load after the shedding so far (W)
     for breaker in _shed_order(facts):
+        if remaining_W <= facts.max_inverter_power_W:
+            break
         result.actions.append(ActionIntent(
             breaker_id=breaker.id, device_id=breaker.device_id, action='off',
-            reason='emergency shed: inverter protection',
+            reason='emergency shed: inverter overload',
         ))
-    _set_grid(facts, result, on=True, reason='feed remaining loads from grid while the inverter recovers')
+        remaining_W -= max(breaker.cur_power_W or 0.0, 0.0)
     result.alerts.append(AlertIntent(
         kind='inverter_protection', severity='critical',
         message=(
-            f'Inverter protection engaged: heatsink {facts.heatsink_temp_C} degC, '
-            f'joule deficit {facts.joule_deficit_J:.0f} J. Non-mandatory loads shed.'
+            f'Inverter overload: load {facts.load_power_W:.0f} W at/above the '
+            f'{facts.max_inverter_power_W:.0f} W rating (heatsink {facts.heatsink_temp_C} degC, '
+            f'joule deficit {facts.joule_deficit_J:.0f} J). Loads shed by priority until it fits.'
         ),
     ))
     return result
+
+
+def _inverter_heat_alert(facts):
+    """Heatsink over its limit without a live overload.
+
+    Current draw is within the rating, so shedding more load would not cool
+    the unit down -- this points at a cooling or hardware fault instead.
+    Returns the alert only; the caller decides which branch runs underneath it.
+    """
+    return AlertIntent(
+        kind='inverter_protection', severity='critical',
+        message=(
+            f'Inverter heatsink at {facts.heatsink_temp_C} degC exceeds the limit but '
+            f'current load ({facts.load_power_W:.0f} W) is within the '
+            f'{facts.max_inverter_power_W:.0f} W rating -- likely a cooling or hardware '
+            f'fault rather than an overload. Inspect the inverter.'
+        ),
+    )
 
 
 def _protect_battery(facts):

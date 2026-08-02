@@ -13,6 +13,119 @@ climate data is embedded in `data.js`), or serve the folder:
 python -m http.server 8791 --directory simulator
 ```
 
+Then open <http://127.0.0.1:8791>. Serving the folder is recommended because
+the Tier-1 bridge CORS policy explicitly trusts this local simulator origin.
+
+## Run the two-tier scenario suite
+
+The scenario runner drives the browser's physical model while evaluating the
+**real** Python rule engines:
+
+- Tier-1 is called through a loopback-only, dependency-free HTTP bridge.
+- Tier-2 is called through the existing Django simulator endpoints.
+- The browser applies both engines' actions, records their returned evidence,
+  enforces Tier-1 safety precedence, and marks declared checks OBSERVED or
+  MISSING. JavaScript does not decide which rule fired or invent commands.
+
+### 1. Start infrastructure and prepare the simulator database
+
+From the repository root:
+
+```bash
+docker compose up -d postgres redis
+python manage.py migrate
+python manage.py seed_simulator --reset-history
+```
+
+The command prints the simulator **Organization id**. Enter that value in the
+browser's `Organization id` field. The seed command creates these device ids:
+
+```text
+sim-servers
+sim-fridge
+sim-ac-unit
+sim-event-load
+sim-grid
+```
+
+It also creates the scheduled event used by the event scenario. The
+`--reset-history` option is deliberately limited to the dedicated simulator
+site; it clears old simulator readings, decisions, actions and alerts so a
+repeat run is deterministic. It never targets an arbitrary organization.
+
+### 2. Start the three local processes
+
+Use three terminals from the repository root:
+
+```bash
+# Terminal 1: Django / Tier-2
+python manage.py runserver
+
+# Terminal 2: the real Tier-1 evaluator on loopback
+python -m edge.simulator_bridge
+
+# Terminal 3: browser simulator static server
+python -m http.server 8791 --directory simulator
+```
+
+Celery worker/beat are not required for browser scenarios: the browser invokes
+the Tier-2 cycle endpoint every configured K seconds. The ordinary production
+dispatcher still uses Celery beat.
+
+### 3. Run a scenario
+
+1. Open <http://127.0.0.1:8791>.
+2. Enter the Organization id printed by `seed_simulator`.
+3. Choose a scenario in **Two-tier scenario runner**.
+4. Choose the scenario date and time. A locked field means the scenario relies
+   on seeded date-specific data, such as a scheduled event.
+5. Select **Load** to inspect the safe **BEFORE EVENT** state and its next
+   scheduled disturbance.
+6. If **Tester-controlled condition** appears, choose the battery voltage to
+   inject. The simulator shows the usable charge derived from that voltage and
+   whether it is above, low, or critical relative to the configured floor.
+7. Select **Run scenario** and watch the phase change when the event occurs.
+8. Review **Facts, fired rules & commands**. Each row is based on the response
+   from `edge.tier1_kbs.evaluate`, `apps.kbs.engine.run_cycle`, or the command
+   executor. Expand **Raw engine data** to inspect the exact fact snapshot and
+   returned rule/command payload.
+
+The source labels above the evidence table show the expected Python entry
+points. If a response does not contain matching provenance and facts, the
+simulator treats it as an engine error instead of displaying a successful
+result.
+
+Running the same scenario again reloads its browser state automatically. For a
+completely clean server-side repeat (especially alert-cooldown or night-lockout
+cases), run `python manage.py seed_simulator --reset-history` first.
+
+### Scenario categories
+
+- **Tier-1:** normal, overheat, overload, battery critical/low and grid outage.
+- **Tier-2:** solar surplus, grid purchase, power-saving subset, sudden PV
+  drop, battery protection, night trip, grid outage and scheduled event.
+- **Integrated:** Tier-1 precedence, operation during backend loss, and return
+  of control to Tier-2 after danger clears.
+
+Scenario fault injection is intentionally deterministic: it can force reported
+PV power, heatsink temperature, battery voltage/current and grid voltage while
+leaving the normal manual simulator mode available.
+
+Battery-critical, low-battery countdown, thin-battery grid-outage, and Tier-2
+battery-protection scenarios expose their battery voltage to the tester. When
+the tester controls voltage, usable charge is derived on the browser side from
+the configured protection floor (0% usable) to the bank's full-charge voltage
+(100%). Both values are then sent to the real engines. This prevents a scenario
+from reporting a critical voltage together with an unrelated high capacity.
+Values outside the scenario's expected trigger range are allowed for boundary
+testing; the corresponding expected engine output will remain **MISSING** if
+the real rule does not fire.
+
+On desktop, drag either narrow green-highlighted divider between the left,
+center, and right columns to resize the panels. The widths persist in local
+browser storage. Double-click a divider to restore the default layout; when a
+divider has keyboard focus, use the arrow keys (Shift for larger steps).
+
 ## Real data
 
 `data/solar_data.csv` holds **real monthly climatology from the NASA POWER
@@ -79,6 +192,12 @@ logs every decision branch, action and alert in the panel. Connecting also
 enables the data push and switches the site's `data_source` to `simulator`.
 A breaker switched off and back on (by the user or the KBS) re-enters its
 peak phase for its full peak time.
+
+When Tier-1 is connected, it evaluates every 500 ms of real time. While it
+reports an active safety situation, a Tier-2 command cannot switch a
+non-grid load back ON. Tier-2 OFF commands and an AC-grid ON command are still
+allowed. Once Tier-1 reports that the danger cleared, pending Tier-2 control
+can resume.
 
 ## Pushing to the KBS backend
 

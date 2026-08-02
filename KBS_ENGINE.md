@@ -205,7 +205,13 @@ flowchart TD
     GATHER --> THR[active threshold ramps\nnormal → event level over prep hours]
     THR --> PROT{heat high OR\njoule deficit high?}
 
-    PROT -- yes --> SHED[protect_inverter\nshed comfort→normal · never mandatory\nAC-grid ON · critical alert]
+    PROT -- yes --> OVERLOAD{live overload?\ncurrent load ≥ rating}
+    OVERLOAD -- yes --> SHED[protect_inverter.overload\nshed comfort→normal until load fits\nAC-grid untouched · critical alert]
+    OVERLOAD -- no --> HEATONLY{heat high?}
+    HEATONLY -- yes --> HALERT[alert: cooling/hardware fault\nnot a load problem — no shed]
+    HEATONLY -- no --> NOOP[deficit alone, no overload:\nnothing to act on now]
+    HALERT --> BATT_LOW
+    NOOP --> BATT_LOW
     PROT -- no --> BATT_LOW{battery voltage near\nits protection floor?}
 
     BATT_LOW -- yes --> CTD[protect_battery\ncountdown OFF on sheddable loads\ncountdown = buffer Wh / draw W\nnotify user · grid ON unless power saving]
@@ -296,9 +302,15 @@ Every cycle takes **exactly one branch**; the branch code is stored on the
   breaker — shedding candidate lists are built from comfort/normal only, and
   in power-saving budgeting the mandatory draw is subtracted from the budget
   *before* the auction between the other loads.
-- **Grid as last resort in protection.** During inverter protection, the
-  AC-grid breaker is switched ON so the remaining (mandatory) loads are fed
-  from the grid while the inverter recovers.
+- **The AC-grid breaker is never touched during inverter protection.** It is
+  the inverter's own AC input, not a separate supply line to the loads —
+  every watt bought from the grid still passes through the same
+  overloaded/overheated unit. Switching it on during `protect_inverter.overload`
+  would add current, not remove it, so the only real fix is shedding until the
+  load fits the rating; a heatsink over its limit without a live overload gets
+  an alert instead (likely a cooling/hardware fault, which shedding can't fix).
+  Grid purchases stay a day/night-branch decision, made once the inverter
+  itself is no longer stressed.
 - **Unhealthy breakers.** A breaker that is offline or reports a `fault` is
   never commanded ON; a `breaker_fault` alert is raised instead (critical if
   it's the AC-grid breaker being needed).

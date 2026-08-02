@@ -49,6 +49,7 @@ const state = {
   batteryCapacityWh: 5000, // usable battery energy at 100% (Wh)
   batterySocWh: 3000,      // energy currently stored (Wh)
   batteryNominalV: 24,     // nominal bank voltage (V)
+  batteryVoltageOverrideV: null, // tester-supplied sensor voltage; null uses the physical charge/load model (V|null)
 
   heatsinkC: 25,          // current heatsink temperature (degC)
 
@@ -68,12 +69,168 @@ const state = {
     lastAlertTs: '',       // created_at of the newest alert already logged (ISO text)
   },
 
+  tier1: {
+    connected: false,      // local Tier-1 bridge evaluation enabled (flag)
+    baseUrl: 'http://127.0.0.1:8788', // loopback-only Python bridge URL (text)
+    intervalMs: 500,       // real-time cadence of local safety evaluation (ms)
+    lastEvalRealMs: 0,     // performance clock of the latest request (ms)
+    busy: false,           // prevents overlapping bridge requests (flag)
+    status: 'disconnected',// bridge connection/evaluation status (text)
+    situation: '',         // latest non-empty Tier1Result situation, or '' (text)
+    log: [],               // recent Tier-1 messages, newest first
+    config: {
+      heatsink_temp_limit_C: 70,
+      overload_fraction: 1.05,
+      battery_low_voltage_V: 24,
+      battery_low_margin_V: 0.5,
+      battery_critical_margin_V: 0.1,
+      battery_shutdown_buffer_percent: 2,
+      grid_present_min_V: 100,
+    },
+  },
+
+  scenario: {
+    definition: null,      // selected scenario object, or null (SMARTBREAKER_SCENARIOS item)
+    active: false,         // scenario timer/timeline currently running (flag)
+    hasRun: false,         // selected setup already ran and must be reloaded before another run
+    startedRealMs: 0,      // performance clock at scenario start (ms)
+    startedSimMs: 0,       // simulated clock at scenario start (ms since epoch)
+    nextEventIndex: 0,     // next scenario timeline event to apply (index)
+    overrides: {},         // forced sensor values for deterministic fault injection
+    events: [],            // per-load copy of timeline events, editable without mutating scenario definitions
+    batteryVoltageDeterminesSoc: false, // true when this scenario's chosen voltage must derive usable charge
+    observations: null,    // Tier-1/Tier-2 outputs collected during this run
+    originalBaseUrl: '',   // backend URL restored after an offline scenario (text)
+    log: [],               // scenario timeline, newest first
+  },
+
+  evidence: {
+    entries: [],           // actual Python-engine facts/rules/commands plus executor outcomes
+    filter: 'all',         // all | T1 | T2 | EXECUTOR
+    sequence: 0,           // stable newest-first row id (count)
+    lastTier1FactsRealMs: 0, // throttle repetitive Tier-1 fact snapshots (ms)
+  },
+
   lastRealMs: performance.now(), // real timestamp of the previous tick (ms)
 };
 
 // ============================= helpers ====================================
 
 const $ = (id) => document.getElementById(id);
+
+function initPanelResizers() {
+  const shell = $('dashboard-shell');
+  const leftColumn = $('dashboard-column-left');
+  const rightColumn = $('dashboard-column-right');
+  const leftHandle = $('resizer-left');
+  const rightHandle = $('resizer-right');
+  if (!shell || !leftColumn || !rightColumn || !leftHandle || !rightHandle) return;
+
+  const minimum = { left: 240, center: 420, right: 320 };
+  const storageKey = 'smartbreaker-simulator-column-widths';
+  const currentWidths = () => ({
+    left: leftColumn.getBoundingClientRect().width,
+    right: rightColumn.getBoundingClientRect().width,
+  });
+  const availableWidth = () => shell.clientWidth - leftHandle.offsetWidth - rightHandle.offsetWidth;
+
+  function updateSeparatorValues() {
+    const widths = currentWidths();
+    leftHandle.setAttribute('aria-valuenow', String(Math.round(widths.left)));
+    rightHandle.setAttribute('aria-valuenow', String(Math.round(widths.right)));
+    leftHandle.title = `Drag to resize · left panel ${Math.round(widths.left)} px · double-click to reset`;
+    rightHandle.title = `Drag to resize · right panel ${Math.round(widths.right)} px · double-click to reset`;
+  }
+
+  function setWidths(requestedLeft, requestedRight, moving = 'both') {
+    const available = availableWidth();
+    if (leftHandle.offsetWidth === 0 ||
+        available < minimum.left + minimum.center + minimum.right) return;
+    let left = requestedLeft;
+    let right = requestedRight;
+    if (moving === 'left') {
+      right = Math.max(right, minimum.right);
+      left = Math.min(Math.max(left, minimum.left), available - minimum.center - right);
+    } else if (moving === 'right') {
+      left = Math.max(left, minimum.left);
+      right = Math.min(Math.max(right, minimum.right), available - minimum.center - left);
+    } else {
+      left = Math.min(Math.max(left, minimum.left), available - minimum.center - minimum.right);
+      right = Math.min(Math.max(right, minimum.right), available - minimum.center - left);
+    }
+    shell.style.setProperty('--left-column-width', `${Math.round(left)}px`);
+    shell.style.setProperty('--right-column-width', `${Math.round(right)}px`);
+    updateSeparatorValues();
+  }
+
+  function saveWidths() {
+    try { localStorage.setItem(storageKey, JSON.stringify(currentWidths())); } catch { /* storage may be disabled */ }
+  }
+
+  function resetWidths() {
+    shell.style.removeProperty('--left-column-width');
+    shell.style.removeProperty('--right-column-width');
+    try { localStorage.removeItem(storageKey); } catch { /* storage may be disabled */ }
+    updateSeparatorValues();
+  }
+
+  function wireHandle(handle, side) {
+    handle.setAttribute('aria-orientation', 'vertical');
+    handle.setAttribute('aria-valuemin', String(minimum[side]));
+    handle.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      const startX = event.clientX;
+      const start = currentWidths();
+      handle.setPointerCapture(event.pointerId);
+      handle.classList.add('dragging');
+      document.body.classList.add('column-resizing');
+
+      const move = (moveEvent) => {
+        const delta = moveEvent.clientX - startX;
+        if (side === 'left') setWidths(start.left + delta, start.right, 'left');
+        else setWidths(start.left, start.right - delta, 'right');
+      };
+      const stop = () => {
+        handle.classList.remove('dragging');
+        document.body.classList.remove('column-resizing');
+        handle.removeEventListener('pointermove', move);
+        handle.removeEventListener('pointerup', stop);
+        handle.removeEventListener('pointercancel', stop);
+        saveWidths();
+      };
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('pointerup', stop);
+      handle.addEventListener('pointercancel', stop);
+    });
+    handle.addEventListener('keydown', (event) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      event.preventDefault();
+      const step = event.shiftKey ? 40 : 10;
+      const direction = event.key === 'ArrowRight' ? 1 : -1;
+      const widths = currentWidths();
+      if (side === 'left') setWidths(widths.left + direction * step, widths.right, 'left');
+      else setWidths(widths.left, widths.right - direction * step, 'right');
+      saveWidths();
+    });
+    handle.addEventListener('dblclick', resetWidths);
+  }
+
+  wireHandle(leftHandle, 'left');
+  wireHandle(rightHandle, 'right');
+  try {
+    const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
+    if (Number.isFinite(saved?.left) && Number.isFinite(saved?.right)) {
+      setWidths(saved.left, saved.right);
+    }
+  } catch { /* ignore malformed or unavailable storage */ }
+  updateSeparatorValues();
+  window.addEventListener('resize', () => {
+    if (!shell.style.getPropertyValue('--left-column-width')) return;
+    const widths = currentWidths();
+    setWidths(widths.left, widths.right);
+  });
+}
 
 function cityRow(monthNum) {
   // The real-climatology row for the selected city and a month (1-12).
@@ -217,11 +374,35 @@ function gridBreakerOn() {
 
 // ============================= power flow =================================
 
+function batteryVoltageRange() {
+  // The configured protection floor represents 0% *usable* charge. Energy
+  // below that voltage is deliberately unavailable because discharging it
+  // would damage the bank. The full point follows the existing 24 V model and
+  // scales for 12/48 V banks.
+  const scale = state.batteryNominalV / 24;
+  const floorV = state.tier1.config.battery_low_voltage_V;
+  const fullV = Math.max(27.4 * scale, floorV + 0.1);
+  return { floorV, fullV, scale };
+}
+
+function batterySocFromVoltage(voltageV) {
+  const { floorV, fullV } = batteryVoltageRange();
+  return Math.min(Math.max((voltageV - floorV) / (fullV - floorV), 0), 1);
+}
+
+function synchronizeBatteryChargeToVoltage(voltageV) {
+  const socFrac = batterySocFromVoltage(voltageV);
+  state.batterySocWh = state.batteryCapacityWh * socFrac;
+  if ($('inp-batsoc')) $('inp-batsoc').value = (socFrac * 100).toFixed(1);
+  return socFrac;
+}
+
 function batteryVoltageV(socFrac, dischargeW) {
-  // Simple bank voltage model: linear open-circuit curve over state of charge
-  // plus sag proportional to discharge power. Scaled from a 24 V bank.
-  const scale = state.batteryNominalV / 24;                           // 12/24/48 V bank scaling (ratio)
-  const openCircuit = (22.4 + 5.0 * socFrac) * scale;                 // resting voltage: 22.4 V empty -> 27.4 V full on 24 V (V)
+  // Linear usable-charge curve plus sag proportional to discharge power.
+  // This is the forward form of batterySocFromVoltage(), so tester-selected
+  // voltage and reported capacity no longer contradict one another.
+  const { floorV, fullV, scale } = batteryVoltageRange();
+  const openCircuit = floorV + (fullV - floorV) * socFrac;
   const sag = 1.2 * scale * (dischargeW / Math.max(state.batteryCapacityWh, 1)); // load sag, ~1.2 V at 1C on 24 V (V)
   return openCircuit - sag;
 }
@@ -229,7 +410,9 @@ function batteryVoltageV(socFrac, dischargeW) {
 function stepPower(simDtS, row) {
   // One simulation step of the whole electrical site. simDtS: sim seconds elapsed (s).
   const date = new Date(state.simMs);
-  const pvW = currentPvW(date, row);                                 // PV production now (W)
+  const forced = state.scenario.definition ? state.scenario.overrides : {}; // deterministic scenario sensor overrides
+  const modeledPvW = currentPvW(date, row);                          // weather/astronomy PV model (W)
+  const pvW = forced.pvW ?? modeledPvW;                              // scenario may inject an exact PV value (W)
   const pvUsableW = pvW >= state.pvThresholdW ? pvW : 0;             // inverter only harvests PV above the threshold (W)
   const loadW = state.breakers.reduce((sum, b) => sum + breakerDrawW(b), 0); // total AC load (W)
   const gridOn = gridBreakerOn();                                    // AC-grid breaker closed (flag)
@@ -250,6 +433,16 @@ function stepPower(simDtS, row) {
   const dtH = simDtS / 3600;                                         // step length (h)
   state.batterySocWh += chargeW * CHARGE_EFFICIENCY * dtH - dischargeW * dtH;
   state.batterySocWh = Math.min(Math.max(state.batterySocWh, 0), state.batteryCapacityWh);
+  const voltageOverrideV = forced.batteryVoltageV ?? state.batteryVoltageOverrideV;
+  const voltageDeterminesSoc = state.scenario.definition
+    ? state.scenario.batteryVoltageDeterminesSoc
+    : Number.isFinite(state.batteryVoltageOverrideV);
+  if (Number.isFinite(voltageOverrideV) && voltageDeterminesSoc) {
+    // A tester-selected voltage is authoritative. Keep the paired capacity
+    // fact synchronized on every frame instead of reporting an impossible
+    // combination such as 24.05 V and 80% usable charge.
+    state.batterySocWh = state.batteryCapacityWh * batterySocFromVoltage(voltageOverrideV);
+  }
   const socFrac = state.batterySocWh / state.batteryCapacityWh;      // state of charge (0-1)
   const empty = !gridSupplying && dischargeW > 0 && state.batterySocWh <= 0;  // battery exhausted with no working grid: blackout (flag)
 
@@ -257,8 +450,16 @@ function stepPower(simDtS, row) {
   const targetC = row.temp_C + 30 * (loadW / state.maxInverterW) + 8 * (pvW / Math.max(state.maxPvW, 1)); // steady-state temperature (degC)
   state.heatsinkC += (targetC - state.heatsinkC) * Math.min(simDtS / HEATSINK_TAU_S, 1);
 
-  const vBat = batteryVoltageV(socFrac, dischargeW);                 // bank voltage now (V)
-  return { pvW, pvUsableW, loadW, gridOn, gridSupplying, chargeW, dischargeW, socFrac, vBat, empty };
+  const vBat = voltageOverrideV ?? batteryVoltageV(socFrac, dischargeW); // bank voltage, optionally tester-controlled (V)
+  const heatsinkC = forced.heatsinkC ?? state.heatsinkC;             // reported heatsink temperature (degC)
+  const gridVoltageV = forced.gridVoltageV ?? (gridSupplying ? AC_VOLTAGE_V : 0); // sensed grid input (V)
+  const chargeCurrentA = forced.batteryChargeCurrentA ?? (chargeW / Math.max(vBat, 0.1)); // battery charge current (A)
+  const dischargeCurrentA = forced.batteryDischargeCurrentA ?? (dischargeW / Math.max(vBat, 0.1)); // battery discharge current (A)
+  return {
+    pvW, pvUsableW, loadW, gridOn, gridSupplying,
+    chargeW, dischargeW, chargeCurrentA, dischargeCurrentA,
+    socFrac, vBat, heatsinkC, gridVoltageV, empty,
+  };
 }
 
 function buildReading(flow) {
@@ -267,8 +468,8 @@ function buildReading(flow) {
   return {
     organization: state.push.orgId,
     timestamp: date.toISOString(),
-    grid_voltage_V: flow.gridSupplying ? AC_VOLTAGE_V : 0,            // grid voltage is only sensed when the breaker is closed AND the state grid actually has power (V)
-    grid_freq_Hz: flow.gridSupplying ? 50 : 0,                        // (Hz)
+    grid_voltage_V: +flow.gridVoltageV.toFixed(2),                    // grid input sensed by the inverter (V)
+    grid_freq_Hz: flow.gridVoltageV >= 100 ? 50 : 0,                  // (Hz)
     ac_output_voltage_V: AC_VOLTAGE_V,                                // (V)
     ac_output_freq_Hz: 50,                                            // (Hz)
     ac_output_apparent_power_VA: Math.round(flow.loadW / 0.95),       // active power / power factor (VA)
@@ -276,13 +477,13 @@ function buildReading(flow) {
     output_load_percent: Math.round(100 * flow.loadW / state.maxInverterW), // (% of rating)
     bus_voltage_V: 360,                                               // DC bus while running (V)
     battery_voltage_V: +flow.vBat.toFixed(2),                         // (V)
-    battery_charge_current_A: +(flow.chargeW / flow.vBat).toFixed(2), // (A)
+    battery_charge_current_A: +flow.chargeCurrentA.toFixed(2),       // (A)
     battery_capacity_percent: Math.round(flow.socFrac * 100),         // (%)
-    heatsink_temp_C: +state.heatsinkC.toFixed(1),                     // (degC)
+    heatsink_temp_C: +flow.heatsinkC.toFixed(1),                      // (degC)
     pv_input_current_A: +(flow.pvW > 0 ? flow.pvW / MPPT_VOLTAGE_V : 0).toFixed(2), // (A)
     pv_input_voltage_V: flow.pvW > 0 ? MPPT_VOLTAGE_V : 0,            // (V)
     battery_voltage_scc_V: +flow.vBat.toFixed(2),                     // solar charge controller's battery reading (V)
-    battery_discharge_current_A: +(flow.dischargeW / flow.vBat).toFixed(2), // (A)
+    battery_discharge_current_A: +flow.dischargeCurrentA.toFixed(2), // (A)
     device_status_flags: '00010000',                                  // static status bits (text)
     battery_voltage_offset_fans_on: 0,                                // (V)
     eeprom_version: 'sim-1',                                          // (text)
@@ -322,6 +523,7 @@ function tick() {
 
   const simDtS = realDtS * state.scale;                               // simulated seconds this tick (s)
   state.simMs += simDtS * 1000;
+  advanceScenarioTimeline();
 
   const date = new Date(state.simMs);
   const row = cityRow(date.getMonth() + 1);                           // real climate row for this city+month
@@ -338,10 +540,213 @@ function tick() {
   }
 
   const flow = stepPower(simDtS, row);
+  tier1Loop(flow);
   maybePush(flow);
   kbsCountdownCheck();
   kbsLoop();
   render(flow, row, date);
+  updateScenarioRun();
+}
+
+// ============================= Tier-1 edge loop ===========================
+
+function tier1Payload(flow) {
+  // Translate the simulated site into the exact dataclasses consumed by the
+  // real dependency-free edge/tier1_kbs.py evaluator.
+  return {
+    inverter: {
+      ac_output_active_power_W: flow.loadW,
+      heatsink_temp_C: flow.heatsinkC,
+      battery_voltage_V: flow.vBat,
+      battery_capacity_percent: flow.socFrac * 100,
+      battery_charge_current_A: flow.chargeCurrentA,
+      battery_discharge_current_A: flow.dischargeCurrentA,
+      grid_voltage_V: flow.gridVoltageV,
+      pv_charging_power_W: flow.pvUsableW,
+    },
+    breakers: state.breakers.map((b) => ({
+      device_id: b.deviceId,
+      priority_type: b.priorityType,
+      priority_degree: b.priorityDegree,
+      switch: b.switchOn,
+      online: b.online,
+      cur_power_W: breakerDrawW(b),
+    })),
+    config: {
+      ...state.tier1.config,
+      max_inverter_power_W: state.maxInverterW,
+      battery_capacity_Wh: state.batteryCapacityWh,
+    },
+  };
+}
+
+async function tier1Loop(flow) {
+  const t1 = state.tier1;
+  if (!t1.connected || t1.busy) return;
+  const realNow = performance.now();
+  if (realNow - t1.lastEvalRealMs < t1.intervalMs) return;
+  t1.lastEvalRealMs = realNow;
+  t1.busy = true;
+  try {
+    const response = await fetch(`${t1.baseUrl}/evaluate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(tier1Payload(flow)),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail ?? `HTTP ${response.status}`);
+    if (result.engine !== 'edge.tier1_kbs.evaluate' || !result.facts) {
+      throw new Error('Tier-1 bridge did not return real-engine provenance/facts');
+    }
+
+    const previous = t1.situation;
+    t1.situation = result.situation ?? '';
+    t1.status = `evaluated @ ${new Date().toLocaleTimeString()}`;
+    scenarioObserve('tier1_evaluation', { situation: t1.situation });
+    const firstFact = state.evidence.lastTier1FactsRealMs === 0;
+    if (firstFact || t1.situation !== previous ||
+        realNow - state.evidence.lastTier1FactsRealMs >= 2000) {
+      evidenceLog('T1', 'FACT', tier1FactsSummary(result.facts), {
+        engine: result.engine,
+        facts: result.facts,
+      });
+      state.evidence.lastTier1FactsRealMs = realNow;
+    }
+    if (firstFact || t1.situation !== previous) {
+      evidenceLog(
+        'T1', 'RULE',
+        t1.situation
+          ? `Actual Tier-1 rule fired: ${t1.situation}`
+          : 'No Tier-1 safety rule fired for this fact snapshot.',
+        { engine: result.engine, situation: t1.situation },
+      );
+    }
+    if (t1.situation && t1.situation !== previous) {
+      tier1Log(`situation → ${t1.situation}`, 'alert');
+      scenarioLog(`T1 situation → ${t1.situation}`, 'event');
+    } else if (!t1.situation && previous) {
+      tier1Log(`danger cleared (${previous})`);
+      scenarioLog(`T1 danger cleared (${previous})`, 'event');
+    }
+    applyTier1Commands(result.commands ?? []);
+    if (result.notify && result.commands?.length) tier1Log(result.notify, 'alert');
+  } catch (err) {
+    t1.status = `error: ${err.message}`;
+    scenarioObserve('tier1_error', { message: err.message });
+    evidenceLog('T1', 'ERROR', `Tier-1 bridge error: ${err.message}`);
+  } finally {
+    t1.busy = false;
+  }
+}
+
+function applyTier1Commands(commands) {
+  let changed = false;
+  for (const command of commands) {
+    const b = state.breakers.find((item) => item.deviceId === command.device_id);
+    if (!b) continue;
+    scenarioObserve('tier1_command', { ...command });
+    evidenceLog(
+      'T1', 'COMMAND',
+      `${command.device_id} → ${command.action.toUpperCase()}` +
+        `${command.countdown_s > 0 ? ` in ${command.countdown_s}s` : ' immediately'} · ${command.reason}`,
+      { engine: 'edge.tier1_kbs.evaluate', command },
+    );
+    if (command.action === 'off' && command.countdown_s > 0) {
+      const armed = state.kbs.countdowns.some(
+        (item) => item.source === 'T1' && item.deviceId === command.device_id
+      );
+      if (!armed) {
+        state.kbs.countdowns.push({
+          source: 'T1', deviceId: command.device_id,
+          fireAtSimMs: state.simMs + command.countdown_s * 1000,
+          reason: command.reason, actionId: null,
+        });
+        tier1Log(`OFF in ${Math.round(command.countdown_s / 60)} min — ${command.device_id} — ${command.reason}`, 'action');
+        evidenceLog('EXECUTOR', 'SCHEDULED', `Tier-1 countdown armed for ${command.device_id}`, command);
+      }
+      continue;
+    }
+    if (command.action === 'off' && b.switchOn) {
+      b.switchOn = false;
+      tier1Log(`OFF ${command.device_id} — ${command.reason}`, 'action');
+      evidenceLog('EXECUTOR', 'APPLIED', `Applied Tier-1 command: ${command.device_id} OFF`, command);
+      changed = true;
+    } else if (command.action === 'on' && !b.switchOn) {
+      b.switchOn = true;
+      b.onSinceMs = state.simMs;
+      tier1Log(`ON ${command.device_id} — ${command.reason}`, 'action');
+      evidenceLog('EXECUTOR', 'APPLIED', `Applied Tier-1 command: ${command.device_id} ON`, command);
+      changed = true;
+    }
+  }
+  if (changed) renderBreakerTable();
+}
+
+function tier1Log(text, cls = '') {
+  const d = new Date(state.simMs);
+  state.tier1.log.unshift({ t: d.toLocaleTimeString(), text, cls });
+  state.tier1.log = state.tier1.log.slice(0, 20);
+  $('tier1-log').innerHTML = state.tier1.log.map((entry) =>
+    `<div class="entry ${entry.cls}"><span class="t">${entry.t}</span>${entry.text}</div>`
+  ).join('');
+}
+
+// ============================= engine evidence ============================
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;').replaceAll("'", '&#039;');
+}
+
+function tier1FactsSummary(facts) {
+  const inverter = facts?.inverter ?? {};
+  return `load ${Number(inverter.ac_output_active_power_W ?? 0).toFixed(0)} W · ` +
+    `heatsink ${Number(inverter.heatsink_temp_C ?? 0).toFixed(1)} °C · ` +
+    `battery ${Number(inverter.battery_voltage_V ?? 0).toFixed(2)} V · ` +
+    `grid ${Number(inverter.grid_voltage_V ?? 0).toFixed(0)} V · ` +
+    `PV ${Number(inverter.pv_charging_power_W ?? 0).toFixed(0)} W`;
+}
+
+function tier2FactsSummary(facts) {
+  if (!facts) return 'No fact snapshot was returned (cycle skipped).';
+  return `${facts.is_daytime ? 'day' : 'night'} · ` +
+    `load ${Number(facts.load_power_W ?? 0).toFixed(0)} W · ` +
+    `PV ${Number(facts.pv_power_W ?? 0).toFixed(0)} W · ` +
+    `battery ${facts.battery_capacity_percent ?? 'unknown'}% / ${facts.battery_voltage_V ?? 'unknown'} V · ` +
+    `heat_high=${Boolean(facts.heat_high)} · overload=${Boolean(facts.overload)} · ` +
+    `grid_failed=${Boolean(facts.grid_failed)} · sudden_drop=${Boolean(facts.sudden_pv_drop)} · ` +
+    `sudden_draw=${Boolean(facts.sudden_draw)}`;
+}
+
+function evidenceLog(source, kind, summary, raw = null) {
+  state.evidence.sequence += 1;
+  state.evidence.entries.unshift({
+    id: state.evidence.sequence,
+    simTime: new Date(state.simMs).toLocaleString(),
+    source, kind, summary, raw,
+  });
+  state.evidence.entries = state.evidence.entries.slice(0, 250);
+  renderEvidence();
+}
+
+function renderEvidence() {
+  const entries = state.evidence.filter === 'all'
+    ? state.evidence.entries
+    : state.evidence.entries.filter((entry) => entry.source === state.evidence.filter);
+  $('tbl-evidence').querySelector('tbody').innerHTML = entries.map((entry) => {
+    const sourceClass = entry.source.toLowerCase();
+    const kindClass = entry.kind.toLowerCase();
+    const raw = entry.raw === null ? '' :
+      `<details class="evidence-raw"><summary>Raw engine data</summary>` +
+      `<pre>${escapeHtml(JSON.stringify(entry.raw, null, 2))}</pre></details>`;
+    return `<tr>` +
+      `<td>${escapeHtml(entry.simTime)}</td>` +
+      `<td><span class="evidence-source ${sourceClass}">${escapeHtml(entry.source)}</span></td>` +
+      `<td><span class="evidence-kind ${kindClass}">${escapeHtml(entry.kind)}</span></td>` +
+      `<td><div class="evidence-summary">${escapeHtml(entry.summary)}</div>${raw}</td>` +
+      `</tr>`;
+  }).join('');
 }
 
 // ============================= KBS closed loop ============================
@@ -359,11 +764,37 @@ async function kbsLoop() {
   kbsBusy = true;
   try {
     const base = state.push.baseUrl, org = state.push.orgId;
-    const run = await (await fetch(`${base}/api/kbs/sim/run-cycle/`, {
+    const runResponse = await fetch(`${base}/api/kbs/sim/run-cycle/`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ organization: org }),
-    })).json();
-    const st = await (await fetch(`${base}/api/kbs/sim/state/?organization=${org}`)).json();
+    });
+    const run = await runResponse.json();
+    if (!runResponse.ok) throw new Error(run.detail ?? `run-cycle HTTP ${runResponse.status}`);
+    if (run.engine !== 'apps.kbs.engine.run_cycle') {
+      throw new Error('Tier-2 endpoint did not return real-engine provenance');
+    }
+    evidenceLog('T2', 'FACT', tier2FactsSummary(run.facts), {
+      engine: run.engine,
+      facts: run.facts,
+    });
+    evidenceLog(
+      'T2', 'RULE',
+      run.branch
+        ? `Actual Tier-2 branch fired: ${run.branch}`
+        : `Tier-2 cycle skipped: ${run.detail ?? 'no decision'}`,
+      { engine: run.engine, branch: run.branch },
+    );
+    for (const command of (run.actions ?? [])) {
+      evidenceLog(
+        'T2', 'COMMAND',
+        `${command.device_id} → ${command.action.toUpperCase()}` +
+          `${command.countdown_s > 0 ? ` in ${command.countdown_s}s` : ' immediately'} · ${command.reason}`,
+        { engine: run.engine, command },
+      );
+    }
+    const stateResponse = await fetch(`${base}/api/kbs/sim/state/?organization=${org}`);
+    const st = await stateResponse.json();
+    if (!stateResponse.ok) throw new Error(st.detail ?? `state HTTP ${stateResponse.status}`);
     const appliedIds = applyKbsActions(st.pending_actions ?? []);     // BreakerAction ids we executed
     if (appliedIds.length) {
       await fetch(`${base}/api/kbs/sim/ack/`, {
@@ -375,13 +806,19 @@ async function kbsLoop() {
       if (a.created_at > k.lastAlertTs) {
         k.lastAlertTs = a.created_at;
         kbsLog(`ALERT [${a.severity}] ${a.message}`, 'alert');
+        scenarioObserve('tier2_alert', { ...a });
+        evidenceLog('T2', 'ALERT', `[${a.severity}] ${a.kind} · ${a.message}`, a);
       }
     }
     k.branch = run.branch ?? '(skipped)';
+    scenarioObserve('tier2_branch', { branch: k.branch });
     k.status = `cycle @ ${new Date().toLocaleTimeString()}`;
     kbsLog(`cycle → ${k.branch}`);
   } catch (err) {
     k.status = `error: ${err.message}`;
+    scenarioObserve('backend_error', { message: err.message });
+    scenarioLog(`Tier-2/backend error: ${err.message}`, 'fail');
+    evidenceLog('T2', 'ERROR', `Tier-2/backend error: ${err.message}`);
   } finally {
     kbsBusy = false;
   }
@@ -394,28 +831,46 @@ function applyKbsActions(actions) {
   for (const a of actions) {
     const b = state.breakers.find((x) => x.deviceId === a.device_id);
     if (!b) continue; // breaker only exists in the DB, nothing to flip here
+    scenarioObserve('tier2_action_received', { ...a });
+    // A local safety situation owns non-grid load state.  Keep a Tier-2 ON
+    // pending (un-ACKed) until Tier-1 reports that the danger has cleared.
+    if (a.action === 'on' && b.priorityType !== 'ac_grid' && state.tier1.situation) {
+      kbsLog(`BLOCKED ON ${a.device_id} - Tier-1 ${state.tier1.situation} still active`, 'alert');
+      scenarioObserve('tier2_action_blocked', { ...a });
+      evidenceLog(
+        'EXECUTOR', 'BLOCKED',
+        `Did not apply Tier-2 ${a.device_id} ON because Tier-1 ${state.tier1.situation} is active.`,
+        a,
+      );
+      continue;
+    }
     if (a.action === 'on') {
       if (!b.switchOn) { b.switchOn = true; b.onSinceMs = state.simMs; } // peak phase restarts on every OFF->ON
-      kbsLog(`ON  ${a.device_id} — ${a.reason}`, 'action');
+      kbsLog(`ON  ${a.device_id} - ${a.reason}`, 'action');
+      evidenceLog('EXECUTOR', 'APPLIED', `Applied Tier-2 command: ${a.device_id} ON`, a);
     } else if (a.countdown_s > 0) {
       // Delayed shutdown (battery protection): arm the device countdown in
       // simulated time — the breaker keeps running until it fires. The action
       // is ACKed only when the countdown fires, so the server's pending-action
       // dedupe prevents re-arming the same shutdown every cycle.
-      if (state.kbs.countdowns.some((c) => c.deviceId === a.device_id)) continue; // already armed locally
+      if (state.kbs.countdowns.some((c) => c.source === 'T2' && c.deviceId === a.device_id)) continue; // already armed locally
       state.kbs.countdowns.push({
+        source: 'T2',
         deviceId: a.device_id,
         fireAtSimMs: state.simMs + a.countdown_s * 1000,              // countdown counts simulated seconds (ms since epoch)
         reason: a.reason,
         actionId: a.id,                                               // BreakerAction pk, ACKed after firing (unitless)
       });
-      kbsLog(`OFF in ${Math.round(a.countdown_s / 60)} min — ${a.device_id} — ${a.reason}`, 'action');
+      kbsLog(`OFF in ${Math.round(a.countdown_s / 60)} min - ${a.device_id} - ${a.reason}`, 'action');
+      evidenceLog('EXECUTOR', 'SCHEDULED', `Tier-2 countdown armed for ${a.device_id}`, a);
       continue; // not ACKed yet
     } else {
       b.switchOn = false;
-      kbsLog(`OFF ${a.device_id} — ${a.reason}`, 'action');
+      kbsLog(`OFF ${a.device_id} - ${a.reason}`, 'action');
+      evidenceLog('EXECUTOR', 'APPLIED', `Applied Tier-2 command: ${a.device_id} OFF`, a);
     }
     applied.push(a.id);
+    scenarioObserve('tier2_action_applied', { ...a });
   }
   if (applied.length) renderBreakerTable();
   return applied;
@@ -430,13 +885,25 @@ function kbsCountdownCheck() {
     const b = state.breakers.find((x) => x.deviceId === c.deviceId);
     if (b && b.switchOn) {
       b.switchOn = false;
-      kbsLog(`countdown fired: ${c.deviceId} OFF — ${c.reason}`, 'action');
+      const log = c.source === 'T1' ? tier1Log : kbsLog;
+      log(`countdown fired: ${c.deviceId} OFF - ${c.reason}`, 'action');
+      evidenceLog('EXECUTOR', 'APPLIED', `${c.source} countdown fired: ${c.deviceId} OFF`, c);
+      if (c.source === 'T2') {
+        scenarioObserve('tier2_action_applied', {
+          id: c.actionId, device_id: c.deviceId, action: 'off',
+          countdown_s: Math.round((c.fireAtSimMs - state.scenario.startedSimMs) / 1000),
+          reason: c.reason,
+        });
+      }
     }
   }
-  fetch(`${state.push.baseUrl}/api/kbs/sim/ack/`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action_ids: due.map((c) => c.actionId).filter(Boolean) }),
-  }).catch(() => {});
+  const tier2Ids = due.filter((c) => c.source === 'T2' && c.actionId).map((c) => c.actionId);
+  if (tier2Ids.length) {
+    fetch(`${state.push.baseUrl}/api/kbs/sim/ack/`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action_ids: tier2Ids }),
+    }).catch(() => {});
+  }
   renderBreakerTable();
 }
 
@@ -452,12 +919,17 @@ function kbsLog(text, cls = '') {
 async function patchKbsSettings(payload) {
   // Push a settings change (K, mode, power saving, data source) to the server.
   try {
-    await fetch(`${state.push.baseUrl}/api/kbs/settings/?organization=${state.push.orgId}`, {
+    const response = await fetch(`${state.push.baseUrl}/api/kbs/settings/?organization=${state.push.orgId}`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.detail ?? `settings HTTP ${response.status}`);
+    }
   } catch (err) {
     state.kbs.status = `settings error: ${err.message}`;
+    scenarioObserve('backend_error', { message: err.message });
   }
 }
 
@@ -481,6 +953,7 @@ async function maybePush(flow) {
     p.status = `pushed @ ${new Date().toLocaleTimeString()} (telemetry ${r1.status}, breakers ${r2.status})`;
   } catch (err) {
     p.status = `error: ${err.message}`;
+    scenarioObserve('backend_error', { message: err.message });
   }
 }
 
@@ -503,6 +976,10 @@ function render(flow, row, date) {
   const socEl = $('out-soc');
   socEl.textContent = `${Math.round(flow.socFrac * 100)}% · ${flow.vBat.toFixed(1)} V`;
   socEl.className = flow.socFrac < 0.25 ? 'crit' : flow.socFrac < 0.5 ? 'warn' : '';
+  if (document.activeElement !== $('inp-batvoltage')) {
+    $('inp-batvoltage').value = flow.vBat.toFixed(2);
+  }
+  if ($('inp-batsoc').disabled) $('inp-batsoc').value = (flow.socFrac * 100).toFixed(1);
   const sourceEl = $('out-source');
   sourceEl.textContent = flow.empty ? 'BLACKOUT (battery empty)'
     : flow.gridSupplying ? 'grid'
@@ -514,6 +991,9 @@ function render(flow, row, date) {
   $('out-push').textContent = state.push.enabled ? state.push.status : 'off';
   $('out-kbs-status').textContent = state.kbs.connected ? state.kbs.status : 'disconnected';
   $('out-kbs-branch').textContent = state.kbs.branch;
+  $('out-tier1-status').textContent = state.tier1.connected ? state.tier1.status : 'disconnected';
+  $('out-tier1-situation').textContent = state.tier1.situation || 'none';
+  $('out-tier1-situation').className = state.tier1.situation ? 'crit' : '';
 
   drawChart(row, date, flow);
   updateBreakerDraws();
@@ -623,6 +1103,8 @@ function updateBreakerDraws() {
 // ============================= wiring =====================================
 
 function initControls() {
+  initPanelResizers();
+
   // city list
   const cities = [...new Set(SOLAR_DATA.map((r) => r.city))];
   $('inp-city').innerHTML = cities.map((c) => `<option>${c}</option>`).join('');
@@ -678,7 +1160,47 @@ function initControls() {
   $('inp-batsoc').addEventListener('change', (e) => {
     state.batterySocWh = state.batteryCapacityWh * (parseFloat(e.target.value) || 0) / 100;
   });
-  $('inp-batnom').addEventListener('change', (e) => { state.batteryNominalV = parseInt(e.target.value); });
+  $('inp-batnom').addEventListener('change', (e) => {
+    const previousNominalV = state.batteryNominalV;
+    state.batteryNominalV = parseInt(e.target.value);
+    if (previousNominalV > 0 && state.batteryNominalV !== previousNominalV) {
+      const scaledFloorV = state.tier1.config.battery_low_voltage_V *
+        state.batteryNominalV / previousNominalV;
+      state.tier1.config.battery_low_voltage_V = scaledFloorV;
+      $('inp-kbs-batfloor').value = scaledFloorV.toFixed(1);
+      patchKbsSettings({ battery_low_voltage_V: scaledFloorV });
+    }
+    const forcedVoltage = state.scenario.definition
+      ? state.scenario.overrides.batteryVoltageV : state.batteryVoltageOverrideV;
+    if (Number.isFinite(forcedVoltage) &&
+        (!state.scenario.definition || state.scenario.batteryVoltageDeterminesSoc)) {
+      synchronizeBatteryChargeToVoltage(forcedVoltage);
+    }
+    renderScenarioBatteryControl();
+  });
+  $('inp-batvoltage-auto').addEventListener('change', (e) => {
+    if (state.scenario.definition) {
+      e.target.checked = false;
+      return;
+    }
+    $('inp-batvoltage').disabled = e.target.checked;
+    $('inp-batsoc').disabled = !e.target.checked;
+    if (e.target.checked) {
+      state.batteryVoltageOverrideV = null;
+    } else {
+      const voltageV = parseFloat($('inp-batvoltage').value);
+      state.batteryVoltageOverrideV = Number.isFinite(voltageV) ? voltageV : 0;
+      synchronizeBatteryChargeToVoltage(state.batteryVoltageOverrideV);
+    }
+  });
+  $('inp-batvoltage').addEventListener('input', (e) => {
+    const voltageV = parseFloat(e.target.value);
+    if (!Number.isFinite(voltageV)) return;
+    if (state.scenario.definition) state.scenario.overrides.batteryVoltageV = voltageV;
+    else state.batteryVoltageOverrideV = voltageV;
+    if (state.scenario.definition) state.scenario.batteryVoltageDeterminesSoc = true;
+    synchronizeBatteryChargeToVoltage(voltageV);
+  });
 
   // push
   $('inp-baseurl').addEventListener('change', (e) => { state.push.baseUrl = e.target.value.replace(/\/$/, ''); });
@@ -730,11 +1252,587 @@ function initControls() {
     patchKbsSettings({ power_saving: e.target.checked });
   });
   $('inp-kbs-batfloor').addEventListener('change', (e) => {
-    patchKbsSettings({ battery_low_voltage_V: parseFloat(e.target.value) || 0 });
+    const floorV = parseFloat(e.target.value) || 0;
+    state.tier1.config.battery_low_voltage_V = floorV;
+    patchKbsSettings({ battery_low_voltage_V: floorV });
+    const forcedVoltage = state.scenario.definition
+      ? state.scenario.overrides.batteryVoltageV : state.batteryVoltageOverrideV;
+    if (Number.isFinite(forcedVoltage) &&
+        (!state.scenario.definition || state.scenario.batteryVoltageDeterminesSoc)) {
+      synchronizeBatteryChargeToVoltage(forcedVoltage);
+    }
+    renderScenarioBatteryControl();
   });
   $('inp-kbs-mode').addEventListener('change', (e) => {
     patchKbsSettings({ mode: e.target.value });
   });
+
+  // Tier-1 local bridge
+  $('inp-tier1-url').addEventListener('change', (e) => {
+    state.tier1.baseUrl = e.target.value.replace(/\/$/, '');
+  });
+  $('inp-tier1-connected').addEventListener('change', (e) => {
+    state.tier1.connected = e.target.checked;
+    state.tier1.status = e.target.checked ? 'connected, waiting for evaluation…' : 'disconnected';
+    state.tier1.situation = '';
+    state.tier1.lastEvalRealMs = 0;
+    tier1Log(e.target.checked ? 'Tier-1 bridge connected' : 'Tier-1 bridge disconnected');
+  });
+
+  $('inp-evidence-source').addEventListener('change', (e) => {
+    state.evidence.filter = e.target.value;
+    renderEvidence();
+  });
+  $('btn-evidence-clear').addEventListener('click', () => {
+    state.evidence.entries = [];
+    state.evidence.lastTier1FactsRealMs = 0;
+    renderEvidence();
+  });
+
+  initScenarioControls();
+}
+
+// ============================= scenario runner ============================
+
+function freshScenarioObservations() {
+  return {
+    tier1Evaluations: 0,
+    tier1Situations: [],
+    tier1Commands: [],
+    tier1Errors: [],
+    tier2Branches: [],
+    tier2ActionsReceived: [],
+    tier2ActionsApplied: [],
+    tier2ActionsBlocked: [],
+    tier2Alerts: [],
+    backendErrors: [],
+  };
+}
+
+function cloneScenarioEvents(events = []) {
+  return events.map((event) => ({
+    ...event,
+    changes: {
+      ...(event.changes ?? {}),
+      overrides: { ...(event.changes?.overrides ?? {}) },
+      state: { ...(event.changes?.state ?? {}) },
+      breakers: Object.fromEntries(Object.entries(event.changes?.breakers ?? {}).map(
+        ([deviceId, patch]) => [deviceId, { ...patch }]
+      )),
+    },
+  }));
+}
+
+function expectedBatteryVoltageState(voltageV) {
+  const cfg = state.tier1.config;
+  if (voltageV <= cfg.battery_low_voltage_V + cfg.battery_critical_margin_V) {
+    return { label: 'CRITICAL · immediate Tier-1 shedding', className: 'crit' };
+  }
+  if (voltageV <= cfg.battery_low_voltage_V + cfg.battery_low_margin_V) {
+    return { label: 'LOW · protection countdown', className: 'warn' };
+  }
+  return { label: 'ABOVE LOW-BATTERY TRIGGER', className: '' };
+}
+
+function scenarioBatteryControlValue(scenario, control) {
+  if (control.source === 'event') {
+    const events = state.scenario.definition === scenario ? state.scenario.events : scenario.events;
+    return events?.[control.eventIndex]?.changes?.overrides?.batteryVoltageV;
+  }
+  return state.scenario.definition === scenario
+    ? state.scenario.overrides.batteryVoltageV : scenario.setup.overrides?.batteryVoltageV;
+}
+
+function scenarioEventDisplayLabel(event, eventIndex) {
+  const control = state.scenario.definition?.batteryControl;
+  if (control?.source === 'event' && control.eventIndex === eventIndex) {
+    const voltageV = event.changes?.overrides?.batteryVoltageV;
+    if (Number.isFinite(voltageV)) return `${control.eventLabel} ${voltageV} V`;
+  }
+  return event.label;
+}
+
+function renderScenarioBatteryControl() {
+  const panel = $('panel-scenario-inputs');
+  if (!panel) return;
+  const scenario = state.scenario.definition;
+  const control = scenario?.batteryControl;
+  panel.hidden = !control;
+  if (!control) return;
+
+  const voltageV = Number(scenarioBatteryControlValue(scenario, control));
+  const input = $('inp-scenario-battery-voltage');
+  $('lbl-scenario-battery-voltage').textContent = control.label;
+  input.min = String(control.min ?? 0);
+  input.max = String(control.max ?? 100);
+  input.step = String(control.step ?? 0.01);
+  input.value = Number.isFinite(voltageV) ? String(voltageV) : '';
+  input.disabled = Boolean(
+    state.scenario.active && control.source === 'event' &&
+    state.scenario.nextEventIndex > control.eventIndex
+  );
+
+  const socFrac = Number.isFinite(voltageV) ? batterySocFromVoltage(voltageV) : 0;
+  const usableWh = socFrac * state.batteryCapacityWh;
+  $('out-scenario-battery-capacity').textContent = Number.isFinite(voltageV)
+    ? `${(socFrac * 100).toFixed(1)}% · ${Math.round(usableWh)} Wh` : '—';
+  const voltageState = expectedBatteryVoltageState(voltageV);
+  const stateOutput = $('out-scenario-battery-state');
+  stateOutput.textContent = voltageState.label;
+  stateOutput.className = voltageState.className;
+  const { floorV, fullV } = batteryVoltageRange();
+  $('out-scenario-battery-note').textContent =
+    `${control.note} Usable charge is derived between the ${floorV.toFixed(2)} V protection floor ` +
+    `and ${fullV.toFixed(2)} V full-charge point, then sent with the selected voltage.`;
+}
+
+function updateScenarioBatteryControl(value) {
+  const scenario = state.scenario.definition;
+  const control = scenario?.batteryControl;
+  const voltageV = Number(value);
+  if (!control || !Number.isFinite(voltageV)) return;
+  if (control.source === 'event') {
+    const event = state.scenario.events[control.eventIndex];
+    if (!event) return;
+    event.changes.overrides.batteryVoltageV = voltageV;
+    if (state.scenario.nextEventIndex <= control.eventIndex) {
+      $('out-scenario-next').textContent =
+        `${scenarioEventDisplayLabel(event, control.eventIndex)} at +${event.atSimS}s simulated`;
+    }
+  } else {
+    state.scenario.overrides.batteryVoltageV = voltageV;
+    synchronizeBatteryChargeToVoltage(voltageV);
+    $('inp-batvoltage').value = voltageV.toFixed(2);
+  }
+  renderScenarioBatteryControl();
+}
+
+function initScenarioControls() {
+  $('inp-scenario').innerHTML = SMARTBREAKER_SCENARIOS.map((scenario) =>
+    `<option value="${scenario.id}">[${scenario.tier}] ${scenario.name.replace(/^.*·\s*/, '')}</option>`
+  ).join('');
+  $('btn-scenario-load').addEventListener('click', () => loadScenario($('inp-scenario').value));
+  $('btn-scenario-run').addEventListener('click', () => startScenario());
+  $('btn-scenario-stop').addEventListener('click', () => finishScenario(false));
+  $('inp-scenario').addEventListener('change', () => showScenarioPreview($('inp-scenario').value, true));
+  $('inp-scenario-battery-voltage').addEventListener('change', (event) => {
+    updateScenarioBatteryControl(event.target.value);
+  });
+  showScenarioPreview($('inp-scenario').value);
+}
+
+function scenarioDefaultDateTime(scenario) {
+  const [date, timeValue = '00:00:00'] = scenario.setup.localDateTime.split('T');
+  return { date, time: timeValue.slice(0, 8) };
+}
+
+function showScenarioPreview(id, resetDate = true) {
+  const scenario = SMARTBREAKER_SCENARIOS.find((item) => item.id === id);
+  if (!scenario || state.scenario.active) return;
+  $('out-scenario-description').textContent = scenario.description;
+  if (resetDate || !$('inp-scenario-date').value) {
+    const defaults = scenarioDefaultDateTime(scenario);
+    $('inp-scenario-date').value = defaults.date;
+    $('inp-scenario-time').value = defaults.time;
+  }
+  $('inp-scenario-date').disabled = Boolean(scenario.dateLocked);
+  $('inp-scenario-time').disabled = Boolean(scenario.timeLocked);
+  const lockReason = scenario.dateLocked
+    ? 'This scenario date is fixed because its ScheduledEvent is stored in Django.'
+    : 'Choose any start date; the Python facts engine derives season and day/night from it.';
+  $('inp-scenario-date').title = lockReason;
+  $('inp-scenario-time').title = lockReason;
+  if (state.scenario.definition?.id !== id) $('panel-scenario-inputs').hidden = true;
+}
+
+function restoreScenarioBackend() {
+  if (!state.scenario.originalBaseUrl) return;
+  state.push.baseUrl = state.scenario.originalBaseUrl;
+  $('inp-baseurl').value = state.push.baseUrl;
+  state.scenario.originalBaseUrl = '';
+}
+
+function loadScenario(id) {
+  if (state.scenario.active) finishScenario(false);
+  restoreScenarioBackend();
+  const scenario = SMARTBREAKER_SCENARIOS.find((item) => item.id === id);
+  if (!scenario) return;
+  const setup = scenario.setup;
+  const defaults = scenarioDefaultDateTime(scenario);
+  const selectedDate = scenario.dateLocked
+    ? defaults.date : ($('inp-scenario-date').value || defaults.date);
+  const selectedTime = scenario.timeLocked
+    ? defaults.time : ($('inp-scenario-time').value || defaults.time);
+
+  state.scenario.definition = scenario;
+  state.scenario.active = false;
+  state.scenario.hasRun = false;
+  state.scenario.startedRealMs = 0;
+  state.scenario.startedSimMs = 0;
+  state.scenario.nextEventIndex = 0;
+  state.scenario.overrides = { ...(setup.overrides ?? {}) };
+  state.scenario.events = cloneScenarioEvents(scenario.events);
+  state.scenario.batteryVoltageDeterminesSoc = Boolean(scenario.batteryControl);
+  state.scenario.observations = freshScenarioObservations();
+  state.scenario.log = [];
+  state.scenario.originalBaseUrl = state.push.baseUrl;
+
+  state.running = false;
+  state.simMs = new Date(`${selectedDate}T${selectedTime}`).getTime();
+  state.scale = setup.scale;
+  state.weather = setup.weather;
+  state.weatherAuto = setup.weatherAuto;
+  state.nextWeatherPickMs = Number.POSITIVE_INFINITY;
+  state.maxPvW = setup.maxPvW;
+  state.pvThresholdW = setup.pvThresholdW;
+  state.maxInverterW = setup.maxInverterW;
+  state.gridAvailable = setup.gridAvailable;
+  state.batteryCapacityWh = setup.batteryCapacityWh;
+  state.batterySocWh = setup.batteryCapacityWh * setup.batterySocPercent / 100;
+  state.batteryNominalV = setup.batteryNominalV;
+  state.batteryVoltageOverrideV = null;
+  state.heatsinkC = setup.heatsinkC;
+  state.breakers = (setup.breakers ?? []).map((breaker) => ({
+    ...breaker,
+    peakMinutes: breaker.peakMinutes ?? 15,
+    fault: breaker.fault ?? '',
+    onSinceMs: breaker.switchOn ? state.simMs - 60 * 60000 : null,
+  }));
+  state.breakerSeq = state.breakers.length;
+
+  state.push.intervalS = setup.pushIntervalS;
+  state.push.enabled = false;
+  state.push.lastRealMs = 0;
+  state.push.status = 'off';
+  if (setup.backendOffline) state.push.baseUrl = 'http://127.0.0.1:8999';
+
+  state.kbs.connected = false;
+  state.kbs.cycleS = setup.tier2CycleS;
+  state.kbs.lastCycleRealMs = 0;
+  state.kbs.branch = '–';
+  state.kbs.status = 'disconnected';
+  state.kbs.log = [];
+  state.kbs.countdowns = [];
+  state.kbs.lastAlertTs = new Date().toISOString();
+  $('kbs-log').innerHTML = '';
+
+  state.tier1.connected = false;
+  state.tier1.situation = '';
+  state.tier1.status = 'disconnected';
+  state.tier1.lastEvalRealMs = 0;
+  state.tier1.log = [];
+  state.tier1.config.battery_low_voltage_V = setup.batteryFloorV;
+  if (state.scenario.batteryVoltageDeterminesSoc &&
+      Number.isFinite(state.scenario.overrides.batteryVoltageV)) {
+    synchronizeBatteryChargeToVoltage(state.scenario.overrides.batteryVoltageV);
+  }
+  $('tier1-log').innerHTML = '';
+
+  state.evidence.entries = [];
+  state.evidence.lastTier1FactsRealMs = 0;
+  renderEvidence();
+
+  shapeCache.key = '';
+  syncScenarioControls(setup);
+  renderScenarioBatteryControl();
+  renderBreakerTable();
+  $('inp-scenario').value = id;
+  $('out-scenario-description').textContent = scenario.description;
+  $('out-scenario-status').textContent = `Loaded · ${scenario.durationRealS}s real time`;
+  $('out-scenario-phase').textContent = state.scenario.events.length
+    ? 'BEFORE DISTURBANCE' : 'MONITORING';
+  $('out-scenario-next').textContent = state.scenario.events.length
+    ? `${scenarioEventDisplayLabel(state.scenario.events[0], 0)} at +${state.scenario.events[0].atSimS}s simulated`
+    : 'No injected disturbance';
+  scenarioLog(`Loaded ${scenario.name}`, 'event');
+  renderScenarioExpectations(false);
+}
+
+function syncScenarioControls(setup) {
+  const date = new Date(state.simMs);
+  const pad = (value, width = 2) => String(value).padStart(width, '0');
+  $('inp-datetime').value =
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  $('inp-ms').value = '0';
+  $('inp-scale').value = state.scale;
+  $('btn-playpause').textContent = 'Play';
+  $('inp-weather-auto').checked = state.weatherAuto;
+  refreshWeatherOptions();
+  $('inp-weather').value = state.weather;
+  $('inp-season').value = seasonForMonth(date.getMonth() + 1);
+  $('inp-maxpv').value = state.maxPvW;
+  $('inp-pvthreshold').value = state.pvThresholdW;
+  $('inp-maxinv').value = state.maxInverterW;
+  $('inp-grid-available').checked = state.gridAvailable;
+  $('inp-batcap').value = state.batteryCapacityWh;
+  const forcedBatteryVoltage = state.scenario.overrides.batteryVoltageV;
+  const testerControlsVoltage = Number.isFinite(forcedBatteryVoltage) &&
+    state.scenario.batteryVoltageDeterminesSoc;
+  $('inp-batsoc').value = (state.batterySocWh / state.batteryCapacityWh * 100).toFixed(1);
+  $('inp-batsoc').disabled = testerControlsVoltage;
+  $('inp-batvoltage').value = testerControlsVoltage
+    ? forcedBatteryVoltage.toFixed(2)
+    : batteryVoltageV(state.batterySocWh / state.batteryCapacityWh, 0).toFixed(2);
+  $('inp-batvoltage').disabled = !testerControlsVoltage;
+  $('inp-batvoltage-auto').checked = !testerControlsVoltage;
+  $('inp-batvoltage-auto').disabled = true;
+  $('inp-batnom').value = state.batteryNominalV;
+  $('inp-baseurl').value = state.push.baseUrl;
+  $('inp-pushint').value = state.push.intervalS;
+  $('inp-push-enabled').checked = false;
+  $('inp-kbs-connected').checked = false;
+  $('inp-kbs-k').value = state.kbs.cycleS;
+  $('inp-kbs-powersaving').checked = setup.powerSaving;
+  $('inp-kbs-batfloor').value = setup.batteryFloorV;
+  $('inp-kbs-mode').value = 'active';
+  $('inp-tier1-connected').checked = false;
+}
+
+function startScenario() {
+  if (!state.scenario.definition) {
+    loadScenario($('inp-scenario').value);
+  } else if (state.scenario.hasRun) {
+    loadScenario(state.scenario.definition.id);
+  }
+  const scenario = state.scenario.definition;
+  if (!scenario) return;
+  if (state.scenario.active) return;
+
+  state.scenario.active = true;
+  state.scenario.hasRun = true;
+  state.scenario.startedRealMs = performance.now();
+  state.scenario.startedSimMs = state.simMs;
+  state.scenario.nextEventIndex = 0;
+  state.scenario.observations = freshScenarioObservations();
+  state.running = true;
+  state.lastRealMs = performance.now();
+  $('btn-playpause').textContent = 'Pause';
+
+  state.tier1.connected = Boolean(scenario.setup.tier1);
+  state.tier1.status = state.tier1.connected ? 'connected, waiting for evaluation…' : 'disconnected';
+  state.tier1.lastEvalRealMs = 0;
+  $('inp-tier1-connected').checked = state.tier1.connected;
+
+  state.kbs.connected = Boolean(scenario.setup.tier2);
+  state.kbs.status = state.kbs.connected ? 'connected, collecting baseline…' : 'disconnected';
+  state.kbs.lastCycleRealMs = performance.now() - state.kbs.cycleS * 1000 + 6000;
+  state.push.enabled = state.kbs.connected;
+  state.push.lastRealMs = 0;
+  state.push.status = state.push.enabled ? 'waiting for first push…' : 'off';
+  $('inp-kbs-connected').checked = state.kbs.connected;
+  $('inp-push-enabled').checked = state.push.enabled;
+
+  if (state.kbs.connected) {
+    patchKbsSettings({
+      data_source: 'simulator', cycle_seconds: Math.round(state.kbs.cycleS),
+      mode: 'active', power_saving: scenario.setup.powerSaving,
+      battery_low_voltage_V: scenario.setup.batteryFloorV,
+    });
+  }
+  $('out-scenario-status').textContent = `Running · 0/${scenario.durationRealS}s`;
+  $('out-scenario-phase').textContent = state.scenario.events.length
+    ? 'BEFORE DISTURBANCE' : 'MONITORING';
+  scenarioLog('Scenario started', 'event');
+  renderScenarioExpectations(false);
+}
+
+function finishScenario(completed) {
+  if (!state.scenario.definition) return;
+  state.scenario.active = false;
+  state.running = false;
+  state.push.enabled = false;
+  state.kbs.connected = false;
+  state.tier1.connected = false;
+  $('btn-playpause').textContent = 'Play';
+  $('inp-push-enabled').checked = false;
+  $('inp-kbs-connected').checked = false;
+  $('inp-tier1-connected').checked = false;
+  const results = renderScenarioExpectations(true);
+  const passed = results.every((result) => result === 'pass');
+  const label = completed ? (passed ? 'COMPLETE' : 'INCOMPLETE') : 'STOPPED';
+  $('out-scenario-status').textContent = `${label} · ${state.scenario.definition.name}`;
+  $('out-scenario-phase').textContent = completed ? 'FINISHED' : 'STOPPED';
+  $('out-scenario-next').textContent = '-';
+  scenarioLog(
+    completed
+      ? (passed
+          ? 'All expected outputs were observed from the real engines.'
+          : 'One or more expected real-engine outputs were not observed.')
+      : 'Scenario stopped by user',
+    completed && passed ? 'pass' : 'fail',
+  );
+  renderScenarioBatteryControl();
+  restoreScenarioBackend();
+}
+
+function advanceScenarioTimeline() {
+  const runtime = state.scenario;
+  if (!runtime.active || !runtime.definition) return;
+  const elapsedSimS = (state.simMs - runtime.startedSimMs) / 1000;
+  const events = runtime.events;
+  while (runtime.nextEventIndex < events.length &&
+         elapsedSimS >= events[runtime.nextEventIndex].atSimS) {
+    const event = events[runtime.nextEventIndex];
+    applyScenarioChanges(event.changes ?? {});
+    scenarioLog(`+${event.atSimS}s · ${scenarioEventDisplayLabel(event, runtime.nextEventIndex)}`, 'event');
+    runtime.nextEventIndex += 1;
+    $('out-scenario-phase').textContent = event.phase ?? 'DURING DISTURBANCE';
+    const next = events[runtime.nextEventIndex];
+    $('out-scenario-next').textContent = next
+      ? `${scenarioEventDisplayLabel(next, runtime.nextEventIndex)} at +${next.atSimS}s simulated`
+      : 'No more injected events';
+  }
+}
+
+function applyScenarioChanges(changes) {
+  if (changes.overrides) {
+    Object.assign(state.scenario.overrides, changes.overrides);
+    if (state.scenario.batteryVoltageDeterminesSoc &&
+        Number.isFinite(changes.overrides.batteryVoltageV)) {
+      synchronizeBatteryChargeToVoltage(changes.overrides.batteryVoltageV);
+      $('inp-batvoltage').value = changes.overrides.batteryVoltageV.toFixed(2);
+    }
+  }
+  if (changes.state) {
+    Object.assign(state, changes.state);
+  }
+  if (changes.breakers) {
+    for (const [deviceId, patch] of Object.entries(changes.breakers)) {
+      const breaker = state.breakers.find((item) => item.deviceId === deviceId);
+      if (!breaker) continue;
+      if (patch.switchOn && !breaker.switchOn) breaker.onSinceMs = state.simMs;
+      Object.assign(breaker, patch);
+    }
+    renderBreakerTable();
+  }
+  if (changes.backend === 'offline') {
+    state.push.baseUrl = 'http://127.0.0.1:8999';
+  } else if (changes.backend === 'online' && state.scenario.originalBaseUrl) {
+    state.push.baseUrl = state.scenario.originalBaseUrl;
+  }
+  $('inp-baseurl').value = state.push.baseUrl;
+  renderScenarioBatteryControl();
+}
+
+function updateScenarioRun() {
+  const runtime = state.scenario;
+  if (!runtime.active || !runtime.definition) return;
+  const elapsedRealS = (performance.now() - runtime.startedRealMs) / 1000;
+  $('out-scenario-status').textContent =
+    `Running · ${Math.min(Math.floor(elapsedRealS), runtime.definition.durationRealS)}` +
+    `/${runtime.definition.durationRealS}s`;
+  if (elapsedRealS >= runtime.definition.durationRealS) finishScenario(true);
+}
+
+function scenarioObserve(type, value) {
+  const runtime = state.scenario;
+  if (!runtime.active || !runtime.observations) return;
+  const observations = runtime.observations;
+  if (type === 'tier1_evaluation') {
+    observations.tier1Evaluations += 1;
+    if (value.situation && !observations.tier1Situations.includes(value.situation)) {
+      observations.tier1Situations.push(value.situation);
+    }
+  } else if (type === 'tier1_command') observations.tier1Commands.push(value);
+  else if (type === 'tier1_error') observations.tier1Errors.push(value);
+  else if (type === 'tier2_branch') observations.tier2Branches.push(value.branch);
+  else if (type === 'tier2_action_received') observations.tier2ActionsReceived.push(value);
+  else if (type === 'tier2_action_applied') observations.tier2ActionsApplied.push(value);
+  else if (type === 'tier2_action_blocked') observations.tier2ActionsBlocked.push(value);
+  else if (type === 'tier2_alert') observations.tier2Alerts.push(value);
+  else if (type === 'backend_error') observations.backendErrors.push(value);
+  renderScenarioExpectations(false);
+}
+
+function scenarioLog(text, cls = '') {
+  if (!state.scenario.definition) return;
+  const elapsed = state.scenario.startedSimMs
+    ? Math.max((state.simMs - state.scenario.startedSimMs) / 1000, 0) : 0;
+  state.scenario.log.unshift({ t: `+${Math.round(elapsed)}s`, text, cls });
+  state.scenario.log = state.scenario.log.slice(0, 40);
+  $('scenario-log').innerHTML = state.scenario.log.map((entry) =>
+    `<div class="entry ${entry.cls}"><span class="t">${entry.t}</span>${entry.text}</div>`
+  ).join('');
+}
+
+function expectationResult(expectation, final) {
+  const observations = state.scenario.observations ?? freshScenarioObservations();
+  const pendingOrFail = () => final ? 'fail' : 'pending';
+  const matchAction = (action, wanted) =>
+    action.device_id === wanted.deviceId && action.action === wanted.action;
+
+  if (expectation.type === 'tier1_idle') {
+    if (!final) return 'pending';
+    return observations.tier1Evaluations > 0 &&
+      observations.tier1Situations.length === 0 && observations.tier1Commands.length === 0
+      ? 'pass' : 'fail';
+  }
+  if (expectation.type === 'tier1_situation') {
+    return observations.tier1Situations.includes(expectation.value) ? 'pass' : pendingOrFail();
+  }
+  if (expectation.type === 'tier1_action') {
+    const matches = observations.tier1Commands.filter((action) => action.action === expectation.action);
+    const allDevices = expectation.devices.every(
+      (deviceId) => matches.some((action) => action.device_id === deviceId)
+    );
+    const countdownOkay = expectation.countdown === 'positive'
+      ? matches.filter((action) => expectation.devices.includes(action.device_id)).every((action) => action.countdown_s > 0)
+      : expectation.countdown === 'zero'
+        ? matches.filter((action) => expectation.devices.includes(action.device_id)).every((action) => action.countdown_s === 0)
+        : true;
+    return allDevices && countdownOkay ? 'pass' : pendingOrFail();
+  }
+  if (expectation.type === 'tier1_action_absent') {
+    if (!final) return 'pending';
+    return observations.tier1Commands.some((action) => matchAction(action, expectation)) ? 'fail' : 'pass';
+  }
+  if (expectation.type === 'tier2_branch') {
+    return observations.tier2Branches.some((branch) => expectation.values.includes(branch))
+      ? 'pass' : pendingOrFail();
+  }
+  if (expectation.type === 'tier2_action') {
+    const collection = expectation.stage === 'blocked'
+      ? observations.tier2ActionsBlocked
+      : expectation.stage === 'received'
+        ? observations.tier2ActionsReceived : observations.tier2ActionsApplied;
+    const found = collection.find((action) => matchAction(action, expectation));
+    if (!found) return pendingOrFail();
+    if (expectation.countdown === 'positive' && !(found.countdown_s > 0)) return pendingOrFail();
+    return 'pass';
+  }
+  if (expectation.type === 'tier2_action_absent') {
+    if (!final) return 'pending';
+    return observations.tier2ActionsReceived.some((action) => matchAction(action, expectation))
+      ? 'fail' : 'pass';
+  }
+  if (expectation.type === 'tier2_alert') {
+    const acceptedKinds = expectation.kinds ?? [expectation.kind];
+    return observations.tier2Alerts.some((alert) => acceptedKinds.includes(alert.kind))
+      ? 'pass' : pendingOrFail();
+  }
+  if (expectation.type === 'backend_error') {
+    return observations.backendErrors.length ? 'pass' : pendingOrFail();
+  }
+  if (expectation.type === 'breaker_state') {
+    if (!final) return 'pending';
+    const breaker = state.breakers.find((item) => item.deviceId === expectation.deviceId);
+    return breaker && breaker.switchOn === expectation.switchOn ? 'pass' : 'fail';
+  }
+  return final ? 'fail' : 'pending';
+}
+
+function renderScenarioExpectations(final) {
+  const scenario = state.scenario.definition;
+  if (!scenario) {
+    $('scenario-expectations').innerHTML = '';
+    return [];
+  }
+  const results = scenario.expectations.map((expectation) => expectationResult(expectation, final));
+  $('scenario-expectations').innerHTML = scenario.expectations.map((expectation, index) =>
+    `<div class="expectation ${results[index]}">${expectation.label}</div>`
+  ).join('');
+  return results;
 }
 
 function refreshWeatherOptions() {
@@ -756,4 +1854,15 @@ addBreaker({ deviceId: 'sim-servers', priorityType: 'mandatory', priorityDegree:
 addBreaker({ deviceId: 'sim-fridge', priorityType: 'normal', priorityDegree: 3, loadType: 'motor', peakW: 600, normalW: 150, switchOn: true });
 addBreaker({ deviceId: 'sim-ac-unit', priorityType: 'comfort', priorityDegree: 2, loadType: 'motor', peakW: 1800, normalW: 900 });
 addBreaker({ deviceId: 'sim-grid', priorityType: 'ac_grid', priorityDegree: 1, peakW: 0, normalW: 0 });
+
+// Optional automation hook for repeatable browser smoke tests, for example:
+//   /?scenario=t1-overheat&autorun=1
+const query = new URLSearchParams(window.location.search);
+const requestedScenario = query.get('scenario');
+if (requestedScenario && SMARTBREAKER_SCENARIOS.some((item) => item.id === requestedScenario)) {
+  $('inp-scenario').value = requestedScenario;
+  showScenarioPreview(requestedScenario, true);
+  loadScenario(requestedScenario);
+  if (query.get('autorun') === '1') setTimeout(startScenario, 100);
+}
 setInterval(tick, TICK_MS);

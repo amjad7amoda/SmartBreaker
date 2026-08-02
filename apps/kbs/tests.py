@@ -65,6 +65,7 @@ def make_facts(breakers, **overrides):
         heat_high=False,
         joule_deficit_J=0.0,             # no deficit (J)
         deficit_high=False,
+        overload=False,                  # current load within the inverter rating (flag)
         pv_power_W=3000.0,               # strong production (W)
         pv_baseline_W=3000.0,            # steady baseline (W)
         sudden_pv_drop=False,
@@ -91,7 +92,7 @@ def actions_by_device(result):
 
 class ProtectInverterTests(SimpleTestCase):
 
-    def test_heat_high_sheds_comfort_then_normal_never_mandatory(self):
+    def test_overload_sheds_comfort_then_normal_never_mandatory(self):
         breakers = [
             make_breaker(id=1, device_id='server', priority_type='mandatory'),
             make_breaker(id=2, device_id='fridge', priority_type='normal', priority_degree=5),
@@ -99,19 +100,40 @@ class ProtectInverterTests(SimpleTestCase):
             make_breaker(id=4, device_id='lights', priority_type='comfort', priority_degree=7),
             make_breaker(id=5, device_id='grid', priority_type='ac_grid', switch=False),
         ]
-        result = decide(make_facts(breakers, heat_high=True, heatsink_temp_C=85.0))
+        result = decide(make_facts(
+            breakers, heat_high=True, heatsink_temp_C=85.0,
+            overload=True, load_power_W=5250.0,
+        ))
 
-        self.assertEqual(result.branch, 'protect_inverter')
+        self.assertEqual(result.branch, 'protect_inverter.overload')
         off_devices = [a.device_id for a in result.actions if a.action == 'off']
         # comfort first (lowest degree first), then normal; mandatory untouched
         self.assertEqual(off_devices, ['tv', 'lights', 'fridge'])
-        self.assertEqual(actions_by_device(result)['grid'].action, 'on')
+        # the AC-grid breaker is the inverter's own input, not a separate feed
+        # to the loads -- switching it on would add current, not remove it.
+        self.assertNotIn('grid', actions_by_device(result))
         self.assertEqual(result.alerts[0].kind, 'inverter_protection')
         self.assertEqual(result.alerts[0].severity, 'critical')
 
-    def test_joule_deficit_high_triggers_protection_too(self):
+    def test_heat_high_without_overload_alerts_but_does_not_shed(self):
+        breakers = [
+            make_breaker(id=1, device_id='tv', priority_type='comfort'),
+        ]
+        result = decide(make_facts(breakers, heat_high=True, heatsink_temp_C=85.0))
+
+        # current load is within the rating: shedding would not cool the unit
+        off_devices = [a.device_id for a in result.actions if a.action == 'off']
+        self.assertNotIn('tv', off_devices)
+        self.assertEqual(result.alerts[0].kind, 'inverter_protection')
+        self.assertEqual(result.alerts[0].severity, 'critical')
+        self.assertIn('cooling', result.alerts[0].message.lower())
+
+    def test_deficit_alone_without_overload_falls_through_to_day_night(self):
         result = decide(make_facts([], deficit_high=True, joule_deficit_J=4_000_000.0))
-        self.assertEqual(result.branch, 'protect_inverter')
+        # a trailing energy deficit with no live overload isn't an emergency:
+        # the cycle proceeds to the normal day/night branch (noon, PV surplus)
+        self.assertEqual(result.branch, 'day.surplus.comfort_on')
+        self.assertFalse(any(a.kind == 'inverter_protection' for a in result.alerts))
 
     def test_out_of_usage_window_loads_shed_first(self):
         breakers = [
@@ -121,7 +143,7 @@ class ProtectInverterTests(SimpleTestCase):
             make_breaker(id=2, device_id='idle', priority_type='comfort', priority_degree=3,
                          cycle_start=time(20, 0), cycle_end=time(23, 0)),
         ]
-        result = decide(make_facts(breakers, heat_high=True))
+        result = decide(make_facts(breakers, heat_high=True, overload=True, load_power_W=5250.0))
         off_devices = [a.device_id for a in result.actions if a.action == 'off']
         self.assertEqual(off_devices, ['idle', 'inuse'])
 
@@ -174,7 +196,7 @@ class ScheduledEventTests(SimpleTestCase):
             make_breaker(id=1, device_id='projector', priority_type='comfort', event_required=True),
             make_breaker(id=2, device_id='tv', priority_type='comfort'),
         ]
-        result = decide(make_facts(breakers, heat_high=True))
+        result = decide(make_facts(breakers, heat_high=True, overload=True, load_power_W=5250.0))
         off_devices = [a.device_id for a in result.actions if a.action == 'off']
         self.assertEqual(off_devices, ['tv'])  # the event load survives even emergency shedding
 

@@ -2,6 +2,48 @@ from django.db import models
 
 from apps.organizations.models import Organization
 
+from . import crypto
+
+
+class TuyaCredential(models.Model):
+    REGION_CHOICES = [
+        ('us', 'Western America'),
+        ('eu', 'Central Europe'),
+        ('cn', 'China'),
+        ('in', 'India'),
+    ]
+
+    API_BASE_URLS = {
+        'us': 'https://openapi.tuyaus.com',
+        'eu': 'https://openapi.tuyaeu.com',
+        'cn': 'https://openapi.tuyacn.com',
+        'in': 'https://openapi.tuyain.com',
+    }
+
+    organization = models.OneToOneField(
+        Organization, on_delete=models.CASCADE, related_name='tuya_credential'
+    )
+    client_id               = models.CharField(max_length=64)
+    encrypted_client_secret = models.TextField()
+    region                  = models.CharField(max_length=2, choices=REGION_CHOICES, default='us')
+    created_at              = models.DateTimeField(auto_now_add=True)
+    updated_at              = models.DateTimeField(auto_now=True)
+
+    @property
+    def client_secret(self):
+        return crypto.decrypt(self.encrypted_client_secret)
+
+    @client_secret.setter
+    def client_secret(self, raw_secret):
+        self.encrypted_client_secret = crypto.encrypt(raw_secret)
+
+    @property
+    def api_base_url(self):
+        return self.API_BASE_URLS[self.region]
+
+    def __str__(self):
+        return f'Tuya credential for {self.organization.name} ({self.region})'
+
 
 class Breaker(models.Model):
 
@@ -12,29 +54,19 @@ class Breaker(models.Model):
         ('ac_grid', 'AC Grid'),      # ON = site draws state-grid electricity
     ]
 
-    # Rank used to order categories when shedding/restoring: higher = more
-    # important. ac_grid is an actuator, not a load, so it is never ranked.
-    CATEGORY_RANK = {'comfort': 1, 'normal': 2, 'mandatory': 3}
-
-    # Electrical behaviour of the load, used for inverter head-room calculations.
-    LOAD_TYPE_CHOICES = [
-        ('motor', 'Motor'),    # inrush profile: draws peak_load_W for ~motor_peak_minutes after switch-on, then settles to mean_load_W (AC units, pumps)
-        ('normal', 'Normal'),  # flat profile: draws about mean_load_W the whole time
-    ]
-
-    device_id       = models.CharField(max_length=100, unique=True)                                       # hardware identifier reported by the smart breaker (unitless)
-    organization    = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='breakers')  # site (one Organization = one physical site)
-    priority_type   = models.CharField(max_length=20, choices=PRIORITY_TYPE_CHOICES, default='normal')    # importance category, chosen by the user (see choices)
-    priority_degree = models.PositiveIntegerField(default=1)                                              # importance inside the category, chosen by the user; higher = more important (positive integer, unitless)
-    load_type       = models.CharField(max_length=20, choices=LOAD_TYPE_CHOICES, default='normal')        # electrical load profile (see choices)
-    peak_load_W     = models.FloatField(null=True, blank=True)                                            # highest sustained draw, learned in the observing phase (W)
-    mean_load_W     = models.FloatField(null=True, blank=True)                                            # steady-state average draw, learned in the observing phase (W)
-    cycle_start     = models.TimeField(null=True, blank=True)                                             # daily schedule window start for comfort loads (local clock time)
-    cycle_end       = models.TimeField(null=True, blank=True)                                             # daily schedule window end for comfort loads (local clock time)
-    locked_out      = models.BooleanField(default=False)                                                  # True after the KBS trips this breaker (e.g. night sudden-draw); only the user may re-enable (flag)
-    lockout_reason  = models.CharField(max_length=255, blank=True, default='')                            # human-readable reason the lockout was applied (text)
-    locked_at       = models.DateTimeField(null=True, blank=True)                                         # when the lockout was applied (UTC timestamp)
-    created_at      = models.DateTimeField(auto_now_add=True)                                             # row creation time (UTC timestamp)
+    device_id = models.CharField(max_length=100, unique=True)
+    organization= models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='breakers')
+    type= models.CharField(max_length=20, choices=TYPE_CHOICES, default='normal')
+    priority= models.PositiveIntegerField()
+    protected= models.BooleanField(default=False)
+    # Mirrors the device's physical button lock. Kept in sync on every status
+    # read, so it is a cache of device state rather than a source of truth.
+    child_lock = models.BooleanField(default=False)
+    peak_load= models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True,)
+    mean_load = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    cycle_start = models.TimeField(null=True, blank=True)
+    cycle_end = models.TimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ['organization', 'priority_type', '-priority_degree']

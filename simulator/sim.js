@@ -118,117 +118,87 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
-function initPanelResizers() {
+function initDashboardNavigation() {
   const shell = $('dashboard-shell');
-  const leftColumn = $('dashboard-column-left');
-  const rightColumn = $('dashboard-column-right');
-  const leftHandle = $('resizer-left');
-  const rightHandle = $('resizer-right');
-  if (!shell || !leftColumn || !rightColumn || !leftHandle || !rightHandle) return;
+  const pageTitle = $('dashboard-page-title');
+  const destinations = {
+    overview: {
+      button: $('nav-overview'),
+      view: $('view-overview'),
+      title: 'Overview',
+    },
+    observations: {
+      button: $('nav-kbs-observations'),
+      view: $('view-kbs-observations'),
+      title: 'KBS observations',
+    },
+  };
+  if (!shell || !pageTitle || Object.values(destinations).some((item) => !item.button || !item.view)) return;
 
-  const minimum = { left: 240, center: 420, right: 320 };
-  const storageKey = 'smartbreaker-simulator-column-widths';
-  const currentWidths = () => ({
-    left: leftColumn.getBoundingClientRect().width,
-    right: rightColumn.getBoundingClientRect().width,
-  });
-  const availableWidth = () => shell.clientWidth - leftHandle.offsetWidth - rightHandle.offsetWidth;
-
-  function updateSeparatorValues() {
-    const widths = currentWidths();
-    leftHandle.setAttribute('aria-valuenow', String(Math.round(widths.left)));
-    rightHandle.setAttribute('aria-valuenow', String(Math.round(widths.right)));
-    leftHandle.title = `Drag to resize · left panel ${Math.round(widths.left)} px · double-click to reset`;
-    rightHandle.title = `Drag to resize · right panel ${Math.round(widths.right)} px · double-click to reset`;
-  }
-
-  function setWidths(requestedLeft, requestedRight, moving = 'both') {
-    const available = availableWidth();
-    if (leftHandle.offsetWidth === 0 ||
-        available < minimum.left + minimum.center + minimum.right) return;
-    let left = requestedLeft;
-    let right = requestedRight;
-    if (moving === 'left') {
-      right = Math.max(right, minimum.right);
-      left = Math.min(Math.max(left, minimum.left), available - minimum.center - right);
-    } else if (moving === 'right') {
-      left = Math.max(left, minimum.left);
-      right = Math.min(Math.max(right, minimum.right), available - minimum.center - left);
-    } else {
-      left = Math.min(Math.max(left, minimum.left), available - minimum.center - minimum.right);
-      right = Math.min(Math.max(right, minimum.right), available - minimum.center - left);
+  function activate(name, focusTab = false) {
+    const selected = destinations[name] ?? destinations.overview;
+    for (const item of Object.values(destinations)) {
+      const active = item === selected;
+      item.view.hidden = !active;
+      item.view.classList.toggle('active', active);
+      item.button.classList.toggle('active', active);
+      if (active) item.button.setAttribute('aria-current', 'page');
+      else item.button.removeAttribute('aria-current');
     }
-    shell.style.setProperty('--left-column-width', `${Math.round(left)}px`);
-    shell.style.setProperty('--right-column-width', `${Math.round(right)}px`);
-    updateSeparatorValues();
+    pageTitle.textContent = selected.title;
+    shell.scrollTop = 0;
+    if (focusTab) selected.button.focus();
   }
 
-  function saveWidths() {
-    try { localStorage.setItem(storageKey, JSON.stringify(currentWidths())); } catch { /* storage may be disabled */ }
+  destinations.overview.button.addEventListener('click', () => activate('overview'));
+  destinations.observations.button.addEventListener('click', () => activate('observations'));
+  activate('overview');
+}
+
+function initSimulationInputSheet() {
+  const sheet = $('dashboard-column-left');
+  const backdrop = $('simulation-inputs-backdrop');
+  const headerButton = $('btn-open-inputs');
+  const closeButton = $('btn-close-inputs');
+  if (!sheet || !backdrop || !headerButton || !closeButton) return;
+
+  let returnFocus = headerButton;
+
+  function setOpen(open, restoreFocus = true) {
+    if (open) returnFocus = document.activeElement || headerButton;
+    document.body.classList.toggle('input-sheet-open', open);
+    sheet.setAttribute('aria-hidden', String(!open));
+    backdrop.hidden = !open;
+    headerButton.setAttribute('aria-expanded', String(open));
+    if (open) {
+      window.setTimeout(() => closeButton.focus(), 0);
+    } else if (restoreFocus && returnFocus instanceof HTMLElement) returnFocus.focus();
   }
 
-  function resetWidths() {
-    shell.style.removeProperty('--left-column-width');
-    shell.style.removeProperty('--right-column-width');
-    try { localStorage.removeItem(storageKey); } catch { /* storage may be disabled */ }
-    updateSeparatorValues();
-  }
-
-  function wireHandle(handle, side) {
-    handle.setAttribute('aria-orientation', 'vertical');
-    handle.setAttribute('aria-valuemin', String(minimum[side]));
-    handle.addEventListener('pointerdown', (event) => {
-      if (event.button !== 0) return;
-      event.preventDefault();
-      const startX = event.clientX;
-      const start = currentWidths();
-      handle.setPointerCapture(event.pointerId);
-      handle.classList.add('dragging');
-      document.body.classList.add('column-resizing');
-
-      const move = (moveEvent) => {
-        const delta = moveEvent.clientX - startX;
-        if (side === 'left') setWidths(start.left + delta, start.right, 'left');
-        else setWidths(start.left, start.right - delta, 'right');
-      };
-      const stop = () => {
-        handle.classList.remove('dragging');
-        document.body.classList.remove('column-resizing');
-        handle.removeEventListener('pointermove', move);
-        handle.removeEventListener('pointerup', stop);
-        handle.removeEventListener('pointercancel', stop);
-        saveWidths();
-      };
-      handle.addEventListener('pointermove', move);
-      handle.addEventListener('pointerup', stop);
-      handle.addEventListener('pointercancel', stop);
-    });
-    handle.addEventListener('keydown', (event) => {
-      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
-      event.preventDefault();
-      const step = event.shiftKey ? 40 : 10;
-      const direction = event.key === 'ArrowRight' ? 1 : -1;
-      const widths = currentWidths();
-      if (side === 'left') setWidths(widths.left + direction * step, widths.right, 'left');
-      else setWidths(widths.left, widths.right - direction * step, 'right');
-      saveWidths();
-    });
-    handle.addEventListener('dblclick', resetWidths);
-  }
-
-  wireHandle(leftHandle, 'left');
-  wireHandle(rightHandle, 'right');
-  try {
-    const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
-    if (Number.isFinite(saved?.left) && Number.isFinite(saved?.right)) {
-      setWidths(saved.left, saved.right);
+  headerButton.addEventListener('click', () => setOpen(true));
+  closeButton.addEventListener('click', () => setOpen(false));
+  backdrop.addEventListener('click', () => setOpen(false));
+  document.addEventListener('keydown', (event) => {
+    if (!document.body.classList.contains('input-sheet-open')) return;
+    if (event.key === 'Escape') {
+      setOpen(false);
+      return;
     }
-  } catch { /* ignore malformed or unavailable storage */ }
-  updateSeparatorValues();
-  window.addEventListener('resize', () => {
-    if (!shell.style.getPropertyValue('--left-column-width')) return;
-    const widths = currentWidths();
-    setWidths(widths.left, widths.right);
+    if (event.key === 'Tab') {
+      const focusable = [...sheet.querySelectorAll(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )].filter((element) => element.offsetParent !== null);
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
   });
 }
 
@@ -1103,7 +1073,8 @@ function updateBreakerDraws() {
 // ============================= wiring =====================================
 
 function initControls() {
-  initPanelResizers();
+  initDashboardNavigation();
+  initSimulationInputSheet();
 
   // city list
   const cities = [...new Set(SOLAR_DATA.map((r) => r.city))];

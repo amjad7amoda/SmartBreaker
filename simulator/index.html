@@ -7,27 +7,37 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header class="app-header">
+<aside class="app-sidebar" aria-label="Primary navigation">
   <div class="brand-lockup">
     <div class="brand-mark" aria-hidden="true">SB</div>
     <div>
       <h1>SmartBreaker Simulator</h1>
-      <div class="subtitle">Two-tier KBS observability console</div>
+      <div class="subtitle">Two-tier KBS console</div>
     </div>
   </div>
+  <nav class="sidebar-nav" aria-label="Simulator views">
+    <button class="sidebar-tab active" id="nav-overview" type="button" aria-current="page">
+      <span class="sidebar-icon" aria-hidden="true">OV</span>
+      <span><strong>Overview</strong><small>Live site and KBS</small></span>
+    </button>
+    <button class="sidebar-tab" id="nav-kbs-observations" type="button"
+            aria-controls="view-kbs-observations">
+      <span class="sidebar-icon" aria-hidden="true">KB</span>
+      <span><strong>KBS observations</strong><small>Facts, rules and logs</small></span>
+    </button>
+  </nav>
   <div class="header-context">
-    <span class="context-label">Physical model</span>
     <span class="context-chip">NASA POWER climatology</span>
     <span class="context-chip live">Real Python engines</span>
   </div>
-</header>
+</aside>
 
-<!-- ======================= TOP SCENARIO COMMAND BAR ======================= -->
-<section class="scenario-commandbar" id="panel-scenarios">
+<!-- ======================= UNIFIED DASHBOARD HEADER ======================= -->
+<header class="scenario-commandbar dashboard-header" id="panel-scenarios">
   <div class="commandbar-main">
     <div class="commandbar-title">
-      <span class="section-kicker">Scenario control</span>
-      <h2>Choose and run a test</h2>
+      <span class="section-kicker">SmartBreaker dashboard</span>
+      <h2 id="dashboard-page-title">Overview</h2>
     </div>
 
     <div class="scenario-controls">
@@ -47,6 +57,12 @@
       </div>
     </div>
 
+    <button id="btn-open-inputs" class="input-sheet-cta" type="button"
+            aria-controls="dashboard-column-left" aria-expanded="false">
+      <span>Simulation inputs</span>
+      <span aria-hidden="true">→</span>
+    </button>
+
     <div class="scenario-state-rack">
       <div class="state-card status-card">
         <span class="state-label">Status</span>
@@ -65,17 +81,18 @@
   <p id="out-scenario-description" class="scenario-description">
     Select a deterministic scenario to exercise Tier-1, Tier-2, or their interaction.
   </p>
-</section>
+</header>
 
 <main class="dashboard-shell" id="dashboard-shell">
   <!-- ======================= LEFT: INPUTS ======================= -->
-  <aside class="dashboard-column column-left" id="dashboard-column-left" aria-label="Simulation inputs">
+  <aside class="dashboard-column column-left" id="dashboard-column-left" role="dialog"
+         aria-modal="true" aria-hidden="true" aria-labelledby="simulation-inputs-title">
     <div class="column-heading">
       <div>
-        <span class="section-kicker">Left panel</span>
-        <h2>Simulation inputs</h2>
+        <span class="section-kicker">Action sheet</span>
+        <h2 id="simulation-inputs-title">Simulation inputs</h2>
       </div>
-      <span class="column-number">01</span>
+      <button id="btn-close-inputs" class="sheet-close" type="button" aria-label="Close simulation inputs">×</button>
     </div>
 
     <section class="panel" id="panel-time">
@@ -202,18 +219,15 @@
     </section>
   </aside>
 
-  <div class="column-resizer" id="resizer-left" role="separator" tabindex="0"
-       aria-label="Resize simulation inputs and live site panels"
-       aria-controls="dashboard-column-left dashboard-column-center"></div>
-
-  <!-- ======================= CENTER: LIVE SITE ======================= -->
-  <section class="dashboard-column column-center" id="dashboard-column-center" aria-label="Live site monitoring">
-    <div class="column-heading">
+  <!-- ======================= OVERVIEW VIEW ======================= -->
+  <section class="dashboard-view overview-view active" id="view-overview" aria-labelledby="overview-view-title">
+    <div class="view-heading">
       <div>
-        <span class="section-kicker">Center panel</span>
-        <h2>Live site</h2>
+        <span class="section-kicker">Operational dashboard</span>
+        <h2 id="overview-view-title">Overview</h2>
+        <p>Live power, real-engine status, scenario checks, and every breaker in one view.</p>
       </div>
-      <span class="column-number">02</span>
+      <span class="view-badge">Live site</span>
     </div>
 
     <section class="panel scenario-monitor" id="panel-scenario-monitor">
@@ -250,75 +264,13 @@
       </div>
     </section>
 
-    <section class="panel breaker-monitor" id="panel-breakers">
-      <div class="panel-heading">
-        <div>
-          <h3>Breaker state</h3>
-          <span class="panel-subtitle">Commands returned by the engines appear here as real state changes.</span>
-        </div>
-        <button id="btn-add-breaker">+ Add breaker</button>
-      </div>
-      <div class="table-scroll">
-        <table id="tbl-breakers">
-          <thead>
-            <tr>
-              <th>Device ID</th><th>Priority</th><th>Degree</th><th>Load type</th>
-              <th>Peak W</th><th>Normal W</th><th>Peak min</th>
-              <th>Switch</th><th>Online</th><th>Fault</th><th>Draw now</th><th></th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-  </section>
-
-  <div class="column-resizer" id="resizer-right" role="separator" tabindex="0"
-       aria-label="Resize live site and KBS observability panels"
-       aria-controls="dashboard-column-center dashboard-column-right"></div>
-
-  <!-- ======================= RIGHT: KBS OBSERVABILITY ======================= -->
-  <aside class="dashboard-column column-right" id="dashboard-column-right" aria-label="KBS evidence and logs">
-    <div class="column-heading">
+    <div class="view-section-heading" id="kbs-observability-summary">
       <div>
-        <span class="section-kicker">Right panel</span>
-        <h2>KBS observability</h2>
+        <span class="section-kicker">Engine health</span>
+        <h3>KBS observability</h3>
       </div>
-      <span class="column-number">03</span>
+      <span>Connection, active situation, decision branch, and live engine logs</span>
     </div>
-
-    <section class="panel evidence-panel" id="panel-evidence">
-      <div class="panel-heading">
-        <div>
-          <h3>Facts, rules &amp; commands</h3>
-          <span class="panel-subtitle">Evidence returned by the Python engines</span>
-        </div>
-        <button id="btn-evidence-clear" class="small-button">Clear</button>
-      </div>
-      <div class="evidence-toolbar">
-        <label>Source
-          <select id="inp-evidence-source">
-            <option value="all">All engine evidence</option>
-            <option value="T1">Tier-1 only</option>
-            <option value="T2">Tier-2 only</option>
-            <option value="EXECUTOR">Executor only</option>
-          </select>
-        </label>
-        <div class="provenance-list">
-          <span><i class="source-dot t1"></i>edge.tier1_kbs.evaluate</span>
-          <span><i class="source-dot t2"></i>apps.kbs.engine.run_cycle</span>
-        </div>
-      </div>
-      <div class="evidence-table-wrap">
-        <table id="tbl-evidence">
-          <thead>
-            <tr><th>Sim time</th><th>Source</th><th>Type</th><th>Actual engine evidence</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-        <div class="empty-evidence">Run a scenario to stream fact snapshots, fired rules, and commands.</div>
-      </div>
-    </section>
 
     <section class="panel engine-panel" id="panel-tier1">
       <div class="panel-heading">
@@ -372,6 +324,74 @@
       <div id="kbs-log" class="engine-log"></div>
     </section>
 
+    <section class="panel breaker-monitor" id="panel-breakers">
+      <div class="panel-heading">
+        <div>
+          <h3>Breaker state</h3>
+          <span class="panel-subtitle">Commands returned by the engines appear here as real state changes.</span>
+        </div>
+        <button id="btn-add-breaker">+ Add breaker</button>
+      </div>
+      <div class="breaker-table-frame">
+        <table id="tbl-breakers">
+          <thead>
+            <tr>
+              <th>Device ID</th><th>Priority</th><th>Degree</th><th>Load type</th>
+              <th>Peak W</th><th>Normal W</th><th>Peak min</th>
+              <th>Switch</th><th>Online</th><th>Fault</th><th>Draw now</th><th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+
+  <!-- ======================= KBS OBSERVATIONS VIEW ======================= -->
+  <section class="dashboard-view kbs-observations-view" id="view-kbs-observations"
+           aria-labelledby="kbs-observations-title" hidden>
+    <div class="view-heading">
+      <div>
+        <span class="section-kicker">Engine evidence</span>
+        <h2 id="kbs-observations-title">KBS observations</h2>
+        <p>Inspect facts, fired rules, returned commands, alerts, and raw inverter data.</p>
+      </div>
+      <span class="view-badge">Real Python engines</span>
+    </div>
+
+    <section class="panel evidence-panel" id="panel-evidence">
+      <div class="panel-heading">
+        <div>
+          <h3>Facts, rules &amp; commands</h3>
+          <span class="panel-subtitle">Evidence returned by the Python engines</span>
+        </div>
+        <button id="btn-evidence-clear" class="small-button">Clear</button>
+      </div>
+      <div class="evidence-toolbar">
+        <label>Source
+          <select id="inp-evidence-source">
+            <option value="all">All engine evidence</option>
+            <option value="T1">Tier-1 only</option>
+            <option value="T2">Tier-2 only</option>
+            <option value="EXECUTOR">Executor only</option>
+          </select>
+        </label>
+        <div class="provenance-list">
+          <span><i class="source-dot t1"></i>edge.tier1_kbs.evaluate</span>
+          <span><i class="source-dot t2"></i>apps.kbs.engine.run_cycle</span>
+        </div>
+      </div>
+      <div class="evidence-table-wrap">
+        <table id="tbl-evidence">
+          <thead>
+            <tr><th>Sim time</th><th>Source</th><th>Type</th><th>Actual engine evidence</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="empty-evidence">Run a scenario to stream fact snapshots, fired rules, and commands.</div>
+      </div>
+    </section>
+
     <section class="panel reading-panel" id="panel-reading">
       <details>
         <summary>
@@ -384,8 +404,11 @@
         <pre id="out-reading">&mdash;</pre>
       </details>
     </section>
-  </aside>
+  </section>
 </main>
+
+<button class="sheet-backdrop" id="simulation-inputs-backdrop" type="button"
+        aria-label="Close simulation inputs" hidden></button>
 
 <script src="data.js"></script>
 <script src="scenarios.js"></script>

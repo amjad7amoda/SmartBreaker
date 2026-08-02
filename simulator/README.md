@@ -121,10 +121,17 @@ Values outside the scenario's expected trigger range are allowed for boundary
 testing; the corresponding expected engine output will remain **MISSING** if
 the real rule does not fire.
 
-On desktop, drag either narrow green-highlighted divider between the left,
-center, and right columns to resize the panels. The widths persist in local
-browser storage. Double-click a divider to restore the default layout; when a
-divider has keyboard focus, use the arrow keys (Shift for larger steps).
+The simulator uses a standard dashboard layout:
+
+- The unified header contains the scenario filter, date/time filter, run
+  actions, status, and the **Simulation inputs** CTA.
+- **Simulation inputs** opens a right-side action sheet containing simulated
+  time, environment, electrical-model, scenario-condition, and backend fields.
+- The sidebar **Overview** tab contains power flow, scenario status, KBS
+  observability, and the complete breaker table. The breaker table has no
+  independent horizontal or vertical scroll area.
+- The sidebar **KBS observations** tab contains the detailed facts, fired
+  rules, commands, alerts, and raw inverter payload.
 
 ## Real data
 

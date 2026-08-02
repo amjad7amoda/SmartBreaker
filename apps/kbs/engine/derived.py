@@ -1,14 +1,7 @@
-"""Pure numeric helpers that turn raw telemetry windows into derived facts.
-
-No Django imports here — everything operates on plain values so it is easy to
-unit-test and to reuse on the Raspberry Pi emergency KBS later.
-"""
-
 from datetime import datetime, time, timedelta
 
 
 def mean(values):
-    """Arithmetic mean of a list of numbers; None if the list is empty (same unit as input)."""
     values = [v for v in values if v is not None]
     return sum(values) / len(values) if values else None
 
@@ -34,6 +27,35 @@ def joule_deficit_J(samples):
         if dt_s > 0:
             total_J += (d0 + d1) / 2.0 * dt_s         # trapezoid: W * s = J
     return total_J
+
+
+def expected_draw_W(load_type, minutes_since_on, motor_peak_minutes,
+                    peak_load_W, mean_load_W, cur_power_W):
+    """Power a breaker pulls (or will pull) while ON (W).
+
+    Motor loads draw ``peak_load_W`` during their first ``motor_peak_minutes``
+    after switch-on (inrush phase), then settle to ``mean_load_W``. For a
+    breaker that is OFF and being considered for switch-on, the inrush phase
+    is still ahead, so the peak applies.
+
+    load_type:          electrical profile: 'motor'|'normal'
+    minutes_since_on:   minutes since the last OFF->ON; None if OFF or unknown (min)
+    motor_peak_minutes: how long a motor load draws its peak after switch-on (min)
+    peak_load_W:        learned peak draw; None when not learned yet (W)
+    mean_load_W:        learned steady-state draw; None when not learned yet (W)
+    cur_power_W:        instantaneous draw, last-resort estimate; None if unknown (W)
+    """
+    in_peak_phase = (
+        load_type == 'motor'
+        and (minutes_since_on is None or minutes_since_on < motor_peak_minutes)
+    )  # True while the motor inrush phase applies (flag)
+    if in_peak_phase and peak_load_W is not None:
+        return peak_load_W
+    if mean_load_W is not None:
+        return mean_load_W
+    if cur_power_W is not None:
+        return cur_power_W
+    return 0.0
 
 
 def is_sudden_drop(current_W, baseline_W, drop_fraction, min_baseline_W=100.0):

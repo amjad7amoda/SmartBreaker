@@ -5,26 +5,20 @@ from .models import Breaker, BreakerReading, BreakerStatus
 
 
 class BreakerStatusIngestSerializer(serializers.Serializer):
-    """One live-state report for one breaker, pushed by the edge (Raspberry Pi).
-
-    Mirrors the raw parameters the smart breaker exposes; units follow the
-    device (milli-units), conversion to base units happens in the KBS engine.
-    """
-
-    device_id     = serializers.CharField(max_length=100)                                        # hardware identifier of the reporting breaker (unitless)
-    timestamp     = serializers.DateTimeField(required=False)                                    # sample time at the edge; defaults to server receive time (UTC timestamp)
-    switch        = serializers.BooleanField()                                                   # relay position: True = ON (flag)
+    device_id = serializers.CharField(max_length=100)                                        # hardware identifier of the reporting breaker (unitless)
+    timestamp = serializers.DateTimeField(required=False)                                    # sample time at the edge; defaults to server receive time (UTC timestamp)
+    switch = serializers.BooleanField()                                                   # relay position: True = ON (flag)
     countdown_1_s = serializers.IntegerField(required=False, default=0, min_value=0)             # remaining on-device flip timer; 0 = none armed (s)
     cur_current_mA = serializers.FloatField(required=False, allow_null=True, default=None)       # instantaneous current (mA)
-    cur_power_mW   = serializers.FloatField(required=False, allow_null=True, default=None)       # instantaneous active power (mW)
+    cur_power_mW = serializers.FloatField(required=False, allow_null=True, default=None)       # instantaneous active power (mW)
     cur_voltage_mV = serializers.FloatField(required=False, allow_null=True, default=None)       # instantaneous voltage (mV)
-    fault         = serializers.CharField(required=False, allow_blank=True, default='')          # device fault flags; empty = healthy (text)
-    relay_status  = serializers.ChoiceField(
+    fault = serializers.CharField(required=False, allow_blank=True, default='')          # device fault flags; empty = healthy (text)
+    relay_status = serializers.ChoiceField(
         choices=BreakerStatus.RELAY_STATUS_CHOICES, required=False, default='last'
     )                                                                                            # power-recovery behaviour configured on the device
-    child_lock    = serializers.BooleanField(required=False, default=False)                      # physical buttons locked (flag)
-    cycle_time    = serializers.CharField(required=False, allow_blank=True, default='')          # raw on-device cycling-schedule string (text)
-    online        = serializers.BooleanField(required=False, default=True)                       # breaker reachable on the network (flag)
+    child_lock = serializers.BooleanField(required=False, default=False)                      # physical buttons locked (flag)
+    cycle_time = serializers.CharField(required=False, allow_blank=True, default='')          # raw on-device cycling-schedule string (text)
+    online= serializers.BooleanField(required=False, default=True)                       # breaker reachable on the network (flag)
 
     def validate_device_id(self, value):
         try:
@@ -50,6 +44,7 @@ class BreakerStatusIngestSerializer(serializers.Serializer):
         status.child_lock     = validated_data['child_lock']
         status.cycle_time     = validated_data['cycle_time']
         status.online         = validated_data['online']
+        
         if switched_on:
             status.last_switched_on_at = sample_time
         status.save()
@@ -66,8 +61,6 @@ class BreakerStatusIngestSerializer(serializers.Serializer):
 
 
 class BreakerSerializer(serializers.ModelSerializer):
-    """Breaker configuration as managed by the client user (priorities, schedule, lockout)."""
-
     class Meta:
         model = Breaker
         fields = (

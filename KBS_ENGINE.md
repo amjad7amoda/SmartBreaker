@@ -41,26 +41,83 @@ apps/breakers/                       extended
 └── migrations/0002  data-preserving renames + new models
 
 apps/kbs/                            new app
-├── models.py        KBSSettings, ScheduledEvent, KBSDecision, BreakerAction, Alert
-├── engine/
-│   ├── facts.py     DB + clock + unit conversion → one SystemFacts snapshot
-│   ├── derived.py   pure math: joule deficit, baselines, sudden drop/draw, season, day/night
-│   ├── rules.py     the decision tree — pure function decide(facts) → RuleResult
-│   ├── grouping.py  PLUG-IN: staggered turn-on groups / best-subset selection
-│   ├── weather.py   PLUG-IN: weather API (season works already; condition/sunrise TODO)
-│   └── actions.py   run_cycle(): gather → decide → persist decision/actions/alerts/lockouts
-├── tasks.py         Celery beat dispatcher (every 60 s) + per-site cycle task
-└── tests.py         16 unit tests — one per decision branch, DB-free
+├── models.py         KBSSettings, ScheduledEvent, KBSDecision, BreakerAction, Alert
+├── engine/           the Experta production system
+│   ├── facts.py      the fact templates: SystemFact, BreakerFact, DecisionFact, CommandFact, AlertFact
+│   ├── gathering.py  DB + clock + unit conversion → the cycle's facts
+│   ├── rules.py      the knowledge base: the flowchart as @Rule declarations
+│   ├── strategies.py what a rule may DO when it fires (shed, keep subset, switch grid, alert)
+│   ├── results.py    the output contract: RuleResult / ActionIntent / AlertIntent
+│   ├── derived.py    pure math: joule deficit, baselines, sudden drop/draw, season, day/night
+│   ├── grouping.py   PLUG-IN: staggered turn-on groups / best-subset selection
+│   ├── weather.py    PLUG-IN: weather API (season works already; condition/sunrise TODO)
+│   └── actions.py    run_cycle(): gather → run the rules → persist decision/actions/alerts/lockouts
+├── tasks.py          Celery beat dispatcher (every 60 s) + per-site cycle task
+└── tests.py          36 unit tests — one per decision branch plus the engine mechanics, DB-free
 ```
 
-Design rule: **`rules.py` is pure.** All database access, clock reads and unit
-conversions happen in `facts.py`; the decision logic is a function of a frozen
-snapshot, so every flowchart branch is unit-testable with fabricated facts.
+Design rule: **the knowledge base is pure.** All database access, clock reads
+and unit conversions happen in `gathering.py`; the rules only ever see the
+facts in working memory, so every flowchart branch is unit-testable with
+fabricated facts.
 
 Code style rule (project-wide): every variable/field carries an inline comment
 with its **meaning and unit**. Breaker hardware reports milli-units (mA / mW /
 mV); the inverter reports base units (V / A / W); the engine computes in W, Wh,
-J. Conversion happens once, in `facts.py`.
+J. Conversion happens once, in `gathering.py`.
+
+### 2.1 The rule engine (Experta)
+
+Tier-2 is a real production system, not a hand-written decision tree: the
+facts are declared into [Experta](https://github.com/nilp0inter/experta)'s
+working memory and the rules whose patterns match compete on the agenda.
+
+```python
+class SystemFact(Fact):
+    organization_id = Field(int, mandatory=True)   # Organization primary key (unitless)
+    heat_high       = Field(bool, mandatory=True)  # heatsink at/above the protection limit (flag)
+    ...                                            # ~35 fields, all documented with their unit
+
+@Rule(
+    AS.system << SystemFact(is_daytime=True, sudden_pv_drop=False,
+                            pv_power_W=MATCH.pv_W, mean_load_on_W=MATCH.load_W),
+    TEST(lambda pv_W, load_W: pv_W > load_W),
+    NOT(DecisionFact()),
+    salience=BRANCH,
+)
+def day_surplus_comfort_on(self, system, **_):
+    """The panels out-produce the running loads: spend the surplus on comfort."""
+    self.take_branch('day.surplus.comfort_on')
+    self.turn_on_due_comfort(system['headroom_W'])
+    self.switch_grid(False, 'PV/battery cover the loads')
+```
+
+Three mechanisms carry what used to be `if`/`else` nesting:
+
+| Mechanism | Role | Where |
+|---|---|---|
+| **salience** | conflict resolution: `PROTECT_INVERTER 100 > PROTECT_BATTERY 90 > DIAGNOSE 60 > PREFER_TRIP 55 > BRANCH 50 > FOLLOW_UP 10` | `rules.py` header |
+| **`DecisionFact`** | mutual exclusion: every branch rule carries `NOT(DecisionFact())` and declares one when it fires, so exactly **one** branch is taken per cycle and the losers leave the agenda | `take_branch()` |
+| **`TEST` / joins** | the numeric and cross-fact conditions of the chart: PV vs. load, reserve vs. need, "the breaker behind the night draw is sheddable" (a join on `sudden_draw_culprit_id` ↔ `BreakerFact.id`) | each rule |
+
+Facts declare their fields with `Field(...)`, so Experta **validates every
+declared fact**: a wrong type or a missing mandatory field fails loudly at
+declaration instead of silently never matching a rule.
+
+Conclusions are facts too — `CommandFact` / `AlertFact` are declared by the
+rules and read back out of working memory by `RuleResult.from_working_memory()`
+in declaration order, so the output list reads like the engine's reasoning log.
+
+Set-level decisions (what fits in the inverter head-room, which subset
+survives a power budget) cannot be expressed fact-by-fact by pattern matching;
+they live in `strategies.py`, which reads the `BreakerFact`s back out of
+working memory and does plain set math on them.
+
+> **Install note.** Experta 1.9.4 (2018) pins `frozendict==1.2`, whose module
+> body uses `collections.Mapping` — removed in Python 3.10. `frozendict` 2.x is
+> a drop-in for the one symbol Experta imports, so after
+> `pip install -r requirements.txt` run
+> `pip install --no-deps --upgrade "frozendict>=2.4"`.
 
 ---
 
@@ -141,7 +198,8 @@ learning and the night sudden-draw **culprit detection**.
 ### 3.5 Engine output models
 
 - **`KBSDecision`** — one row per cycle: the branch code taken + a full JSON
-  snapshot of the `SystemFacts` it was based on (audit trail).
+  snapshot of the working memory it fired on,
+  `{'system': {...}, 'breakers': [...]}` (audit trail).
 - **`BreakerAction`** — the actual output: `(breaker, 'on'|'off', countdown_s,
   reason, executed)` — the new state the breakers must be switched to.
   `countdown_s = 0` means switch immediately; `> 0` means arm the device
@@ -165,15 +223,19 @@ Celery beat (60 s) ─→ run_kbs_cycles (dispatcher)
                         └─ for each active site whose K elapsed:
                              run_kbs_cycle_for_org
                                └─ run_cycle(org)
-                                    ├─ gather_facts(org, settings)   facts.py   (DB, clock, units)
-                                    ├─ decide(facts)                 rules.py   (pure)
-                                    └─ _persist(...)                 actions.py (decision + actions + alerts + lockouts)
+                                    ├─ gather_facts(org, settings)   gathering.py  (DB, clock, units)
+                                    ├─ decide(facts)                 rules.py      (declare → run → collect)
+                                    └─ _persist(...)                 actions.py    (decision + actions + alerts + lockouts)
 ```
+
+`decide()` is the whole engine run: build a `SmartBreakerKBS`, `reset()`,
+`declare(*facts)`, `run()`, then read the conclusions back out of working
+memory as a `RuleResult`.
 
 `mode='observing'` → the cycle stops before deciding: telemetry keeps being
 collected for learning, but no actions are taken.
 
-### 4.2 Derived signals (computed in `facts.py` / `derived.py`)
+### 4.2 Derived signals (computed in `gathering.py` / `derived.py`)
 
 | Signal | How it is derived |
 |---|---|
@@ -194,13 +256,17 @@ collected for learning, but no actions are taken.
 
 ### 4.3 The decision tree
 
+Read as the rule agenda: each box is one `@Rule` in `rules.py`, each diamond
+is a condition in its left-hand side, and the vertical order is the salience
+order.
+
 ```mermaid
 flowchart TD
     BEAT([Celery beat · every 60 s]) --> DUE{site's K elapsed?}
     DUE -- no --> WAIT([wait])
     DUE -- yes --> MODE{KBSSettings.mode}
     MODE -- observing --> OBS([collect data only — no actions])
-    MODE -- active --> GATHER[gather SystemFacts]
+    MODE -- active --> GATHER[gather facts:\nSystemFact + one BreakerFact per breaker]
     GATHER -- no readings --> SKIP([skip cycle])
     GATHER --> THR[active threshold ramps\nnormal → event level over prep hours]
     THR --> PROT{heat high OR\njoule deficit high?}
@@ -321,7 +387,7 @@ Every cycle takes **exactly one branch**; the branch code is stored on the
 
 | Where | What plugs in | Contract |
 |---|---|---|
-| `engine/grouping.py` | **The owners' grouping algorithm** (staggered group turn-on / optimal subset). Currently naive greedy fallbacks marked `TODO(user-algorithm)`. | `first_group_within_headroom(candidates, headroom_W, motor_peak_minutes) → [BreakerFacts]` and `select_best_subset(candidates, budget_W, motor_peak_minutes) → [BreakerFacts]` |
+| `engine/grouping.py` | **The owners' grouping algorithm** (staggered group turn-on / optimal subset). Currently naive greedy fallbacks marked `TODO(user-algorithm)`. | `first_group_within_headroom(candidates, headroom_W) → [BreakerFact]` and `select_best_subset(candidates, budget_W) → [BreakerFact]`; each candidate's motor inrush is already folded into its `expected_draw_W` field |
 | `engine/weather.py` | **The external weather API** (condition + sunrise/sunset). Season already works locally (date + hemisphere). Marked `TODO(weather-api)`. | `get_weather_context(latitude_deg, longitude_deg, local_now) → WeatherContext(season, condition, sunrise, sunset)` |
 
 ---
@@ -353,6 +419,8 @@ site runs at its own K without needing per-site beat entries.
 Run locally:
 
 ```bash
+pip install -r requirements.txt
+pip install --no-deps --upgrade "frozendict>=2.4"   # see the install note in §2.1
 python manage.py migrate          # needs Postgres up
 celery -A config worker -l info
 celery -A config beat -l info
@@ -362,15 +430,21 @@ celery -A config beat -l info
 
 ## 8. Tests
 
-`apps/kbs/tests.py` — 16 tests, one (or more) per decision branch, built on
-fabricated `SystemFacts`/`BreakerFacts`. Because `decide()` is pure they need
-**no database**: shedding order, mandatory protection, head-room limiting,
-schedule windows, season alerts, night reserve math, culprit tripping,
-re-enable memory, and every grid on/off fallback.
+`apps/kbs/tests.py` — 36 tests, one (or more) per decision branch, built on
+fabricated `SystemFact`/`BreakerFact` snapshots. The rules never touch the
+database, so the tests need **no database**: shedding order, mandatory
+protection, head-room limiting, schedule windows, season alerts, night reserve
+math, culprit tripping, re-enable memory, and every grid on/off fallback.
+
+`KnowledgeBaseTests` covers the Experta mechanics themselves: that only one
+branch is taken when several rules match at once, that the salience order
+holds, that the chart is **total** (no situation leaves the engine silent),
+that an unavailable breaker is reported instead of commanded, and that a
+malformed fact is rejected at declaration.
 
 `manage.py test` insists on creating a Postgres test database; without one
 running, use the standalone runner pattern (django.setup() + unittest) — all
-tests are `SimpleTestCase`. All 16 pass as of this commit; `manage.py check`
+tests are `SimpleTestCase`. All 36 pass as of this commit; `manage.py check`
 is clean and `makemigrations --check` shows no drift.
 
 ---

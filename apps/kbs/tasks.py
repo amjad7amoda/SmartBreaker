@@ -1,10 +1,3 @@
-"""Celery entry points of the main (server-side) KBS.
-
-Celery beat fires ``run_kbs_cycles`` every minute (see CELERY_BEAT_SCHEDULE);
-that dispatcher checks each active site's own cycle period (``cycle_seconds``,
-the K from the flowchart) and queues one cycle task per site that is due.
-"""
-
 from celery import shared_task
 from django.utils import timezone
 
@@ -16,7 +9,6 @@ from .models import KBSDecision, KBSSettings
 
 @shared_task
 def run_kbs_cycles():
-    """Dispatcher: queue a decision cycle for every site whose K elapsed."""
     now = timezone.now()  # dispatch wall-clock time (UTC timestamp)
     due = 0               # number of sites queued this dispatch (count)
     for kbs in KBSSettings.objects.filter(mode='active').select_related('organization'):

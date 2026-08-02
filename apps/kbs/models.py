@@ -96,7 +96,7 @@ class KBSDecision(models.Model):
 
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='kbs_decisions')  # the site this cycle ran for
     branch       = models.CharField(max_length=100)                                                         # decision-tree path code, e.g. 'day.surplus.comfort_on' (text)
-    facts        = models.JSONField(default=dict)                                                           # snapshot of the SystemFacts the decision was based on (JSON)
+    facts        = models.JSONField(default=dict)                                                           # working-memory snapshot the rules fired on: {'system': {...}, 'breakers': [...]} (JSON)
     created_at   = models.DateTimeField(auto_now_add=True)                                                  # cycle time (UTC timestamp)
 
     class Meta:
@@ -120,7 +120,7 @@ class BreakerAction(models.Model):
     action      = models.CharField(max_length=10, choices=ACTION_CHOICES)                           # target relay state (see choices)
     countdown_s = models.PositiveIntegerField(default=0)                                           # 0 = switch immediately; >0 = set the device countdown so the switch happens after this delay (s)
     reason      = models.CharField(max_length=255)                                                  # why the KBS chose this action (text)
-    executed    = models.BooleanField(default=False)                                                # True once the edge confirms the switch was applied (flag)
+    executed    = models.BooleanField(default=False)                                               # True once the edge confirms the switch was applied (flag)
     created_at  = models.DateTimeField(auto_now_add=True)                                           # command creation time (UTC timestamp)
 
     class Meta:

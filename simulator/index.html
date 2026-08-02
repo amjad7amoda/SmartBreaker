@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartBreaker Simulator</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<aside class="app-sidebar" aria-label="Primary navigation">
+  <div class="brand-lockup">
+    <div class="brand-mark" aria-hidden="true">SB</div>
+    <div>
+      <h1>SmartBreaker Simulator</h1>
+      <div class="subtitle">Two-tier KBS console</div>
+    </div>
+  </div>
+  <nav class="sidebar-nav" aria-label="Simulator views">
+    <button class="sidebar-tab active" id="nav-overview" type="button" aria-current="page">
+      <span class="sidebar-icon" aria-hidden="true">OV</span>
+      <span><strong>Overview</strong><small>Live site and KBS</small></span>
+    </button>
+    <button class="sidebar-tab" id="nav-kbs-observations" type="button"
+            aria-controls="view-kbs-observations">
+      <span class="sidebar-icon" aria-hidden="true">KB</span>
+      <span><strong>KBS observations</strong><small>Facts, rules and logs</small></span>
+    </button>
+  </nav>
+  <div class="header-context">
+    <span class="context-chip">NASA POWER climatology</span>
+    <span class="context-chip live">Real Python engines</span>
+  </div>
+</aside>
+
+<!-- ======================= UNIFIED DASHBOARD HEADER ======================= -->
+<header class="scenario-commandbar dashboard-header" id="panel-scenarios">
+  <div class="commandbar-main">
+    <div class="commandbar-title">
+      <span class="section-kicker">SmartBreaker dashboard</span>
+      <h2 id="dashboard-page-title">Overview</h2>
+    </div>
+
+    <div class="scenario-controls">
+      <label class="scenario-picker">Scenario
+        <select id="inp-scenario"></select>
+      </label>
+      <label>Start date
+        <input type="date" id="inp-scenario-date">
+      </label>
+      <label>Start time
+        <input type="time" id="inp-scenario-time" step="1">
+      </label>
+      <div class="button-group" aria-label="Scenario actions">
+        <button id="btn-scenario-load">Load</button>
+        <button id="btn-scenario-run" class="primary">Run scenario</button>
+        <button id="btn-scenario-stop" class="quiet-danger">Stop</button>
+      </div>
+    </div>
+
+    <button id="btn-open-inputs" class="input-sheet-cta" type="button"
+            aria-controls="dashboard-column-left" aria-expanded="false">
+      <span>Simulation inputs</span>
+      <span aria-hidden="true">→</span>
+    </button>
+
+    <div class="scenario-state-rack">
+      <div class="state-card status-card">
+        <span class="state-label">Status</span>
+        <span class="scenario-status" id="out-scenario-status">No scenario loaded</span>
+      </div>
+      <div class="state-card phase-card">
+        <span class="state-label">Phase</span>
+        <span id="out-scenario-phase">Not started</span>
+      </div>
+      <div class="state-card next-card">
+        <span class="state-label">Next event</span>
+        <span id="out-scenario-next">&mdash;</span>
+      </div>
+    </div>
+  </div>
+  <p id="out-scenario-description" class="scenario-description">
+    Select a deterministic scenario to exercise Tier-1, Tier-2, or their interaction.
+  </p>
+</header>
+
+<main class="dashboard-shell" id="dashboard-shell">
+  <!-- ======================= LEFT: INPUTS ======================= -->
+  <aside class="dashboard-column column-left" id="dashboard-column-left" role="dialog"
+         aria-modal="true" aria-hidden="true" aria-labelledby="simulation-inputs-title">
+    <div class="column-heading">
+      <div>
+        <span class="section-kicker">Action sheet</span>
+        <h2 id="simulation-inputs-title">Simulation inputs</h2>
+      </div>
+      <button id="btn-close-inputs" class="sheet-close" type="button" aria-label="Close simulation inputs">×</button>
+    </div>
+
+    <section class="panel" id="panel-time">
+      <div class="panel-heading">
+        <h3>Simulated time</h3>
+        <span class="panel-tag">Clock</span>
+      </div>
+      <div class="control-grid">
+        <label class="full-field">Date &amp; time
+          <input type="datetime-local" id="inp-datetime" step="1">
+        </label>
+        <label>Milliseconds
+          <input type="number" id="inp-ms" min="0" max="999" value="0">
+        </label>
+        <label>Time scale
+          <input type="number" id="inp-scale" min="0.1" max="86400" step="0.1" value="60">
+        </label>
+        <button id="btn-playpause" class="primary full-field">Pause simulation</button>
+      </div>
+      <div class="stacked-readouts">
+        <div class="readout"><span class="readout-label">Sim clock</span><span id="out-simclock">&mdash;</span></div>
+        <div class="readout"><span class="readout-label">Day / night</span><span id="out-daynight">&mdash;</span></div>
+        <div class="readout"><span class="readout-label">Sun window</span><span id="out-sunwindow">&mdash;</span></div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-location">
+      <div class="panel-heading">
+        <h3>Environment</h3>
+        <span class="panel-tag">Climate</span>
+      </div>
+      <div class="control-grid">
+        <label>City
+          <select id="inp-city"></select>
+        </label>
+        <label>Season <span class="hint">Derived from date</span>
+          <select id="inp-season">
+            <option value="winter">winter</option>
+            <option value="summer">summer</option>
+          </select>
+        </label>
+        <label class="full-field">Weather
+          <select id="inp-weather"></select>
+        </label>
+        <label class="check full-field"><input type="checkbox" id="inp-weather-auto" checked> Auto weather from real climate data</label>
+      </div>
+      <div class="readout climate-readout"><span class="readout-label">Month climate</span><span id="out-climate">&mdash;</span></div>
+    </section>
+
+    <section class="panel" id="panel-power-config">
+      <div class="panel-heading">
+        <h3>Electrical model</h3>
+        <span class="panel-tag">Site</span>
+      </div>
+      <div class="control-grid">
+        <label>Max PV (W)
+          <input type="number" id="inp-maxpv" min="0" step="50" value="4000">
+        </label>
+        <label>PV threshold (W)
+          <input type="number" id="inp-pvthreshold" min="0" step="10" value="80">
+        </label>
+        <label>Inverter max (W)
+          <input type="number" id="inp-maxinv" min="100" step="100" value="4000">
+        </label>
+        <label>Battery capacity (Wh)
+          <input type="number" id="inp-batcap" min="100" step="100" value="5000">
+        </label>
+        <label>Battery charge (%)
+          <input type="number" id="inp-batsoc" min="0" max="100" step="1" value="60">
+        </label>
+        <label>Current voltage (V)
+          <input type="number" id="inp-batvoltage" min="0" step="0.01" value="26.0" disabled>
+        </label>
+        <label>Nominal voltage (V)
+          <select id="inp-batnom">
+            <option value="12">12</option>
+            <option value="24" selected>24</option>
+            <option value="48">48</option>
+          </select>
+        </label>
+        <label class="check full-field"><input type="checkbox" id="inp-batvoltage-auto" checked> Calculate voltage from charge and load</label>
+        <label class="check full-field"><input type="checkbox" id="inp-grid-available" checked> State-grid electricity available</label>
+      </div>
+    </section>
+
+    <section class="panel scenario-input-panel" id="panel-scenario-inputs" hidden>
+      <div class="panel-heading">
+        <div>
+          <h3>Tester-controlled condition</h3>
+          <span class="panel-subtitle">Choose the battery reading used by this scenario</span>
+        </div>
+        <span class="panel-tag accent">Editable</span>
+      </div>
+      <div class="control-grid">
+        <label class="full-field"><span id="lbl-scenario-battery-voltage">Scenario battery voltage (V)</span>
+          <input type="number" id="inp-scenario-battery-voltage" min="0" step="0.01">
+        </label>
+      </div>
+      <div class="stacked-readouts scenario-derived-values">
+        <div class="readout"><span class="readout-label">Derived usable charge</span><span id="out-scenario-battery-capacity">&mdash;</span></div>
+        <div class="readout"><span class="readout-label">Expected voltage state</span><span id="out-scenario-battery-state">&mdash;</span></div>
+      </div>
+      <p class="field-note" id="out-scenario-battery-note"></p>
+    </section>
+
+    <section class="panel" id="panel-push">
+      <div class="panel-heading">
+        <h3>Backend connection</h3>
+        <span class="panel-tag">Telemetry</span>
+      </div>
+      <div class="control-grid">
+        <label class="full-field">Server base URL
+          <input type="text" id="inp-baseurl" value="http://127.0.0.1:8000">
+        </label>
+        <label>Organization ID
+          <input type="number" id="inp-orgid" min="1" value="1">
+        </label>
+        <label>Push every (s)
+          <input type="number" id="inp-pushint" min="1" value="5">
+        </label>
+        <label class="check full-field"><input type="checkbox" id="inp-push-enabled"> Enable telemetry push</label>
+      </div>
+      <div class="readout"><span class="readout-label">Push status</span><span id="out-push">off</span></div>
+    </section>
+  </aside>
+
+  <!-- ======================= OVERVIEW VIEW ======================= -->
+  <section class="dashboard-view overview-view active" id="view-overview" aria-labelledby="overview-view-title">
+    <div class="view-heading">
+      <div>
+        <span class="section-kicker">Operational dashboard</span>
+        <h2 id="overview-view-title">Overview</h2>
+        <p>Live power, real-engine status, scenario checks, and every breaker in one view.</p>
+      </div>
+      <span class="view-badge">Live site</span>
+    </div>
+
+    <section class="panel scenario-monitor" id="panel-scenario-monitor">
+      <div class="panel-heading">
+        <h3>Scenario observation</h3>
+        <span class="panel-tag accent">Live checks</span>
+      </div>
+      <div class="scenario-grid">
+        <div class="monitor-block">
+          <h4>Actual engine-output checks</h4>
+          <div id="scenario-expectations" class="expectations"></div>
+        </div>
+        <div class="monitor-block">
+          <h4>Event timeline</h4>
+          <div id="scenario-log" class="scenario-log"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel power-monitor" id="panel-power">
+      <div class="panel-heading">
+        <h3>Power flow</h3>
+        <span class="panel-tag">Live model</span>
+      </div>
+      <div class="metric-grid">
+        <div class="metric-card pv"><span class="metric-label">PV now</span><strong><span id="out-pv">0</span> <small>W</small></strong></div>
+        <div class="metric-card load"><span class="metric-label">Site load</span><strong><span id="out-load">0</span> <small>W</small></strong></div>
+        <div class="metric-card battery"><span class="metric-label">Battery</span><strong id="out-soc">&mdash;</strong></div>
+        <div class="metric-card source"><span class="metric-label">Active source</span><strong id="out-source">&mdash;</strong></div>
+      </div>
+      <div class="pv-visual">
+        <div class="chart-caption"><span>PV production profile</span><span>Simulated day</span></div>
+        <canvas id="pv-chart" width="820" height="200"></canvas>
+      </div>
+    </section>
+
+    <div class="view-section-heading" id="kbs-observability-summary">
+      <div>
+        <span class="section-kicker">Engine health</span>
+        <h3>KBS observability</h3>
+      </div>
+      <span>Connection, active situation, decision branch, and live engine logs</span>
+    </div>
+
+    <section class="panel engine-panel" id="panel-tier1">
+      <div class="panel-heading">
+        <div>
+          <h3>Tier-1 edge safety</h3>
+          <span class="panel-subtitle">Real local Python evaluator</span>
+        </div>
+        <span class="engine-tier tier-one">T1</span>
+      </div>
+      <div class="compact-controls">
+        <label>Local bridge URL
+          <input type="text" id="inp-tier1-url" value="http://127.0.0.1:8788">
+        </label>
+        <label class="check"><input type="checkbox" id="inp-tier1-connected"> Connect engine</label>
+      </div>
+      <div class="engine-status-grid">
+        <div class="readout"><span class="readout-label">Engine</span><span id="out-tier1-status">disconnected</span></div>
+        <div class="readout"><span class="readout-label">Situation</span><span id="out-tier1-situation">none</span></div>
+      </div>
+      <div id="tier1-log" class="engine-log"></div>
+    </section>
+
+    <section class="panel engine-panel" id="panel-kbs">
+      <div class="panel-heading">
+        <div>
+          <h3>Tier-2 site KBS</h3>
+          <span class="panel-subtitle">Real Django rules engine</span>
+        </div>
+        <span class="engine-tier tier-two">T2</span>
+      </div>
+      <div class="compact-controls two-column-controls">
+        <label class="check full-field"><input type="checkbox" id="inp-kbs-connected"> Connect engine and drive breakers</label>
+        <label>Cycle (real s)
+          <input type="number" id="inp-kbs-k" min="5" step="5" value="60">
+        </label>
+        <label>Battery floor (V)
+          <input type="number" id="inp-kbs-batfloor" min="0" step="0.1" value="24.0">
+        </label>
+        <label>Engine mode
+          <select id="inp-kbs-mode">
+            <option value="active" selected>active</option>
+            <option value="observing">observing</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="inp-kbs-powersaving"> Power saving</label>
+      </div>
+      <div class="engine-status-grid">
+        <div class="readout"><span class="readout-label">Engine</span><span id="out-kbs-status">disconnected</span></div>
+        <div class="readout"><span class="readout-label">Last branch</span><span id="out-kbs-branch">&mdash;</span></div>
+      </div>
+      <div id="kbs-log" class="engine-log"></div>
+    </section>
+
+    <section class="panel breaker-monitor" id="panel-breakers">
+      <div class="panel-heading">
+        <div>
+          <h3>Breaker state</h3>
+          <span class="panel-subtitle">Commands returned by the engines appear here as real state changes.</span>
+        </div>
+        <button id="btn-add-breaker">+ Add breaker</button>
+      </div>
+      <div class="breaker-table-frame">
+        <table id="tbl-breakers">
+          <thead>
+            <tr>
+              <th>Device ID</th><th>Priority</th><th>Degree</th><th>Load type</th>
+              <th>Peak W</th><th>Normal W</th><th>Peak min</th>
+              <th>Switch</th><th>Online</th><th>Fault</th><th>Draw now</th><th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+
+  <!-- ======================= KBS OBSERVATIONS VIEW ======================= -->
+  <section class="dashboard-view kbs-observations-view" id="view-kbs-observations"
+           aria-labelledby="kbs-observations-title" hidden>
+    <div class="view-heading">
+      <div>
+        <span class="section-kicker">Engine evidence</span>
+        <h2 id="kbs-observations-title">KBS observations</h2>
+        <p>Inspect facts, fired rules, returned commands, alerts, and raw inverter data.</p>
+      </div>
+      <span class="view-badge">Real Python engines</span>
+    </div>
+
+    <section class="panel evidence-panel" id="panel-evidence">
+      <div class="panel-heading">
+        <div>
+          <h3>Facts, rules &amp; commands</h3>
+          <span class="panel-subtitle">Evidence returned by the Python engines</span>
+        </div>
+        <button id="btn-evidence-clear" class="small-button">Clear</button>
+      </div>
+      <div class="evidence-toolbar">
+        <label>Source
+          <select id="inp-evidence-source">
+            <option value="all">All engine evidence</option>
+            <option value="T1">Tier-1 only</option>
+            <option value="T2">Tier-2 only</option>
+            <option value="EXECUTOR">Executor only</option>
+          </select>
+        </label>
+        <div class="provenance-list">
+          <span><i class="source-dot t1"></i>edge.tier1_kbs.evaluate</span>
+          <span><i class="source-dot t2"></i>apps.kbs.engine.run_cycle</span>
+        </div>
+      </div>
+      <div class="evidence-table-wrap">
+        <table id="tbl-evidence">
+          <thead>
+            <tr><th>Sim time</th><th>Source</th><th>Type</th><th>Actual engine evidence</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="empty-evidence">Run a scenario to stream fact snapshots, fired rules, and commands.</div>
+      </div>
+    </section>
+
+    <section class="panel reading-panel" id="panel-reading">
+      <details>
+        <summary>
+          <span>
+            <strong>Inverter payload</strong>
+            <small>What the Pi would send</small>
+          </span>
+          <span class="payload-tag">JSON</span>
+        </summary>
+        <pre id="out-reading">&mdash;</pre>
+      </details>
+    </section>
+  </section>
+</main>
+
+<button class="sheet-backdrop" id="simulation-inputs-backdrop" type="button"
+        aria-label="Close simulation inputs" hidden></button>
+
+<script src="data.js"></script>
+<script src="scenarios.js"></script>
+<script src="sim.js"></script>
+</body>
+</html>

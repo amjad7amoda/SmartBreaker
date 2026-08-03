@@ -468,6 +468,7 @@ def _set_grid(facts, result, on, reason):
                 f'{"faulted: " + grid.fault if grid.fault else "offline"}.'
             ),
         ))
+        return
     result.actions.append(ActionIntent(
         breaker_id=grid.id, device_id=grid.device_id,
         action='on' if on else 'off', reason=reason,

@@ -1,21 +1,88 @@
-from rest_framework import generics, mixins
+from django.db import transaction
+from rest_framework import generics, mixins, status
 from rest_framework.exceptions import ValidationError
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.accounts.permissions import IsTechnicianOrAdmin
 
 from . import exceptions, services
-from .models import Breaker, TuyaCredential
+from .models import Breaker, BreakerReading, BreakerStatus, TuyaCredential
 from .tuya import TuyaError
 from .serializers import (
     BreakerChildLockSerializer,
     BreakerCreateSerializer,
     BreakerSerializer,
+    BreakerStatusIngestSerializer,
     BreakerSwitchSerializer,
     BreakerUpdateSerializer,
     TuyaCredentialSerializer,
 )
+
+
+class BreakerStatusIngestView(APIView):
+    """Ingest one simulator/Pi snapshot for every breaker in the payload."""
+
+    permission_classes = [AllowAny]
+
+    @transaction.atomic
+    def post(self, request):
+        serializer = BreakerStatusIngestSerializer(
+            data=request.data,
+            allow_empty=False,
+        )
+        serializer.is_valid(raise_exception=True)
+
+        items = serializer.validated_data
+        breakers = {
+            breaker.device_id: breaker
+            for breaker in Breaker.objects.select_for_update().filter(
+                device_id__in=[item['device_id'] for item in items]
+            )
+        }
+        readings_created = 0
+        for item in items:
+            breaker = breakers[item['device_id']]
+            status_row, _ = BreakerStatus.objects.select_for_update().get_or_create(
+                breaker=breaker
+            )
+            previous_switch = status_row.switch
+            status_row.switch = item['switch']
+            status_row.countdown_1_s = item['countdown_1_s']
+            status_row.cur_current_mA = item.get('cur_current_mA')
+            status_row.cur_power_mW = item.get('cur_power_mW')
+            status_row.cur_voltage_mV = item.get('cur_voltage_mV')
+            status_row.fault = item['fault']
+            status_row.relay_status = item['relay_status']
+            status_row.child_lock = item['child_lock']
+            status_row.cycle_time = item['cycle_time']
+            status_row.online = item['online']
+            if item['switch'] and not previous_switch:
+                status_row.last_switched_on_at = item['timestamp']
+            status_row.save()
+
+            if breaker.child_lock != item['child_lock']:
+                breaker.child_lock = item['child_lock']
+                breaker.save(update_fields=['child_lock'])
+
+            _, created = BreakerReading.objects.get_or_create(
+                breaker=breaker,
+                timestamp=item['timestamp'],
+                defaults={
+                    'switch': item['switch'],
+                    'cur_power_mW': item.get('cur_power_mW'),
+                },
+            )
+            readings_created += int(created)
+
+        return Response(
+            {
+                'received': len(items),
+                'readings_created': readings_created,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class OrganizationScopedMixin:

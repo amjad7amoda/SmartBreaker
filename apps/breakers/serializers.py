@@ -2,7 +2,7 @@ from django.core.cache import cache
 from rest_framework import serializers
 
 from . import exceptions
-from .models import Breaker, TuyaCredential
+from .models import Breaker, BreakerStatus, TuyaCredential
 from .tuya import TuyaClient, TuyaError
 
 
@@ -67,9 +67,10 @@ class BreakerSerializer(serializers.ModelSerializer):
     class Meta:
         model = Breaker
         fields = (
-            'id', 'device_id', 'organization', 'organization_name', 'type', 'priority',
-            'protected', 'child_lock', 'peak_load', 'mean_load', 'cycle_start',
-            'cycle_end', 'created_at',
+            'id', 'device_id', 'organization', 'organization_name',
+            'priority_type', 'priority_degree', 'load_type', 'child_lock',
+            'peak_load_W', 'mean_load_W', 'cycle_start', 'cycle_end',
+            'locked_out', 'lockout_reason', 'locked_at', 'created_at',
         )
         read_only_fields = fields
 
@@ -94,13 +95,17 @@ class BreakerUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Breaker
         fields = (
-            'id', 'device_id', 'organization', 'type', 'priority', 'protected',
-            'child_lock', 'peak_load', 'mean_load', 'cycle_start', 'cycle_end', 'created_at',
+            'id', 'device_id', 'organization', 'priority_type', 'priority_degree',
+            'load_type', 'child_lock', 'peak_load_W', 'mean_load_W',
+            'cycle_start', 'cycle_end', 'locked_out', 'lockout_reason',
+            'locked_at', 'created_at',
         )
         read_only_fields = (
             'id', 'device_id', 'organization', 'created_at',
             # Owned by the device; use the child-lock endpoint to change it.
             'child_lock',
+            # Owned by the KBS; a user-facing unlock flow may clear these later.
+            'locked_out', 'lockout_reason', 'locked_at',
         )
 
 
@@ -110,11 +115,15 @@ class BreakerCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Breaker
         fields = (
-            'id', 'device_id', 'organization', 'type', 'priority', 'protected',
-            'child_lock', 'peak_load', 'mean_load', 'cycle_start', 'cycle_end',
-            'created_at', 'tuya',
+            'id', 'device_id', 'organization', 'priority_type', 'priority_degree',
+            'load_type', 'child_lock', 'peak_load_W', 'mean_load_W',
+            'cycle_start', 'cycle_end', 'locked_out', 'lockout_reason',
+            'locked_at', 'created_at', 'tuya',
         )
-        read_only_fields = ('id', 'created_at', 'tuya', 'child_lock')
+        read_only_fields = (
+            'id', 'created_at', 'tuya', 'child_lock',
+            'locked_out', 'lockout_reason', 'locked_at',
+        )
 
     def get_tuya(self, obj):
         return getattr(self, '_verification', None)
@@ -147,4 +156,48 @@ class BreakerCreateSerializer(serializers.ModelSerializer):
         # offline is reported rather than rejected.
         if not online:
             self._verification['warning'] = 'Device is registered on Tuya but currently offline.'
+        return attrs
+
+
+class BreakerStatusIngestItemSerializer(serializers.Serializer):
+    """One simulator/Pi breaker snapshot in raw device units."""
+
+    device_id = serializers.CharField(max_length=100)
+    timestamp = serializers.DateTimeField()
+    switch = serializers.BooleanField()
+    countdown_1_s = serializers.IntegerField(min_value=0, default=0)
+    cur_current_mA = serializers.FloatField(required=False, allow_null=True)
+    cur_power_mW = serializers.FloatField(required=False, allow_null=True)
+    cur_voltage_mV = serializers.FloatField(required=False, allow_null=True)
+    fault = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
+    relay_status = serializers.ChoiceField(
+        choices=BreakerStatus.RELAY_STATUS_CHOICES, default='last'
+    )
+    child_lock = serializers.BooleanField(default=False)
+    cycle_time = serializers.CharField(
+        max_length=100, required=False, allow_blank=True, default=''
+    )
+    online = serializers.BooleanField(default=False)
+
+
+class BreakerStatusIngestSerializer(serializers.ListSerializer):
+    """Validate device ids before the view performs one atomic bulk ingest."""
+
+    child = BreakerStatusIngestItemSerializer()
+
+    def validate(self, attrs):
+        device_ids = [item['device_id'] for item in attrs]
+        if len(device_ids) != len(set(device_ids)):
+            raise serializers.ValidationError(
+                'Each device_id may appear only once per payload.'
+            )
+        known = set(
+            Breaker.objects.filter(device_id__in=device_ids)
+            .values_list('device_id', flat=True)
+        )
+        unknown = sorted(set(device_ids) - known)
+        if unknown:
+            raise serializers.ValidationError({
+                'device_id': f'Unknown breaker(s): {", ".join(unknown)}.'
+            })
         return attrs

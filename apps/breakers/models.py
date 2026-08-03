@@ -54,18 +54,34 @@ class Breaker(models.Model):
         ('ac_grid', 'AC Grid'),      # ON = site draws state-grid electricity
     ]
 
+    CATEGORY_RANK = {'comfort': 1, 'normal': 2, 'mandatory': 3}
+
+    LOAD_TYPE_CHOICES = [
+        ('motor', 'Motor'),
+        ('normal', 'Normal'),
+    ]
+
     device_id = models.CharField(max_length=100, unique=True)
-    organization= models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='breakers')
-    type= models.CharField(max_length=20, choices=TYPE_CHOICES, default='normal')
-    priority= models.PositiveIntegerField()
-    protected= models.BooleanField(default=False)
+    organization = models.ForeignKey(
+        Organization, on_delete=models.CASCADE, related_name='breakers'
+    )
+    priority_type = models.CharField(
+        max_length=20, choices=PRIORITY_TYPE_CHOICES, default='normal'
+    )
+    priority_degree = models.PositiveIntegerField(default=1)
+    load_type = models.CharField(
+        max_length=20, choices=LOAD_TYPE_CHOICES, default='normal'
+    )
     # Mirrors the device's physical button lock. Kept in sync on every status
     # read, so it is a cache of device state rather than a source of truth.
     child_lock = models.BooleanField(default=False)
-    peak_load= models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True,)
-    mean_load = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    peak_load_W = models.FloatField(null=True, blank=True)
+    mean_load_W = models.FloatField(null=True, blank=True)
     cycle_start = models.TimeField(null=True, blank=True)
     cycle_end = models.TimeField(null=True, blank=True)
+    locked_out = models.BooleanField(default=False)
+    lockout_reason = models.CharField(max_length=255, blank=True, default='')
+    locked_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

@@ -3,8 +3,8 @@ from django.utils import timezone
 
 from apps.organizations.models import Organization
 
-from .engine import run_cycle
 from .models import KBSDecision, KBSSettings
+from .services import run_cycle
 
 
 @shared_task

@@ -1,7 +1,7 @@
 from django import forms
 from django.contrib import admin
 
-from .models import Breaker, TuyaCredential
+from .models import Breaker, BreakerReading, BreakerStatus, TuyaCredential
 
 
 class TuyaCredentialForm(forms.ModelForm):

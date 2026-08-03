@@ -16,8 +16,8 @@ from rest_framework.views import APIView
 
 from apps.organizations.models import Organization
 
-from .engine import run_cycle
 from .models import Alert, BreakerAction, KBSDecision, KBSSettings
+from .services import run_cycle
 
 SETTINGS_EDITABLE_FIELDS = (
     'cycle_seconds', 'power_saving', 'mode', 'data_source',
@@ -60,14 +60,14 @@ class RunCycleView(APIView):
         decision = run_cycle(org)
         if decision is None:
             return Response({
-                'engine': 'apps.kbs.engine.run_cycle',
+                'engine': 'apps.kbs.services.run_cycle',
                 'branch': None,
                 'facts': None,
                 'actions': [],
                 'detail': 'skipped (observing mode or no readings)',
             })
         return Response({
-            'engine': 'apps.kbs.engine.run_cycle',
+            'engine': 'apps.kbs.services.run_cycle',
             'branch': decision.branch,
             'created_at': decision.created_at,
             'facts': decision.facts,
@@ -103,7 +103,7 @@ class SimStateView(APIView):
             'settings': {f: getattr(kbs, f) for f in SETTINGS_EDITABLE_FIELDS},
             'latest_decision': (
                 {
-                    'engine': 'apps.kbs.engine.run_cycle',
+                    'engine': 'apps.kbs.services.run_cycle',
                     'branch': latest.branch,
                     'created_at': latest.created_at,
                     'facts': latest.facts,

@@ -96,7 +96,7 @@ class KBSDecision(models.Model):
 
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='kbs_decisions')  # the site this cycle ran for
     branch       = models.CharField(max_length=100)                                                         # decision-tree path code, e.g. 'day.surplus.comfort_on' (text)
-    facts        = models.JSONField(default=dict)                                                           # working-memory snapshot the rules fired on: {'system': {...}, 'breakers': [...]} (JSON)
+    facts        = models.JSONField(default=dict)                                                           # JSON-safe SystemFacts snapshot, including its nested breakers list (JSON)
     created_at   = models.DateTimeField(auto_now_add=True)                                                  # cycle time (UTC timestamp)
 
     class Meta:

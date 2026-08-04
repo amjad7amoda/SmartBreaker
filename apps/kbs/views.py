@@ -13,6 +13,7 @@ from apps.organizations.models import Organization
 from apps.telemetry.models import Reading
 
 from .climate import CLIMATE_CSV_PATH, ClimateDataError, load_climate_rows
+from .contracts import TIER2_ENGINE
 from .models import Alert, BreakerAction, KBSDecision, KBSSettings
 from .services import run_cycle
 
@@ -128,14 +129,14 @@ class RunCycleView(APIView):
         decision = run_cycle(org)
         if decision is None:
             return Response({
-                'engine': 'apps.kbs.services.run_cycle',
+                'engine': TIER2_ENGINE,
                 'branch': None,
                 'facts': None,
                 'actions': [],
                 'detail': 'skipped (observing mode or no readings)',
             })
         return Response({
-            'engine': 'apps.kbs.services.run_cycle',
+            'engine': TIER2_ENGINE,
             'event_id': str(decision.event_id),
             'branch': decision.branch,
             'trace_version': decision.trace_version,
@@ -156,11 +157,15 @@ class SimStateView(APIView):
         if org is None:
             return Response({'detail': 'unknown organization'}, status=status.HTTP_404_NOT_FOUND)
         kbs, _ = KBSSettings.objects.get_or_create(organization=org)
-        latest = KBSDecision.objects.filter(organization=org).first()
+        # Live state follows server receipt order. Historical/simulated event
+        # time can move backwards and remains available as occurred_at.
+        latest = KBSDecision.objects.filter(
+            organization=org, tier='tier2',
+        ).order_by('-received_at', '-id').first()
         newest_per_breaker = {}
         for action in (
             BreakerAction.objects
-            .filter(decision__organization=org, status__in=('pending', 'scheduled'))
+            .filter(decision__organization=org, decision__tier='tier2', status__in=('pending', 'scheduled'))
             .select_related('breaker', 'decision')
             .order_by('created_at')
         ):
@@ -181,7 +186,7 @@ class SimStateView(APIView):
             'latest_telemetry': _reading_dict(latest_reading),
             'breakers': [_breaker_dict(breaker) for breaker in breakers],
             'metadata': {
-                'engine': 'apps.kbs.services.run_cycle',
+                'engine': TIER2_ENGINE,
                 'data_source': kbs.data_source,
                 'generated_at': timezone.now(),
             },
@@ -192,7 +197,10 @@ class SimStateView(APIView):
                     'tier': latest.tier,
                     'branch': latest.branch,
                     'trace_version': latest.trace_version,
+                    'legacy': latest.is_legacy,
                     'trace': latest.trace,
+                    'occurred_at': latest.occurred_at,
+                    'received_at': latest.received_at,
                     'created_at': latest.created_at,
                     'facts': latest.facts,
                 } if latest else None

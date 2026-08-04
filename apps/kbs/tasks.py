@@ -14,11 +14,11 @@ def run_kbs_cycles():
     for kbs in KBSSettings.objects.filter(mode='active').select_related('organization'):
         last = (
             KBSDecision.objects
-            .filter(organization=kbs.organization)
-            .order_by('-created_at')
+            .filter(organization=kbs.organization, tier='tier2')
+            .order_by('-received_at')
             .first()
         )  # most recent cycle of this site, if any
-        elapsed_s = (now - last.created_at).total_seconds() if last else None  # seconds since the last cycle (s)
+        elapsed_s = (now - last.received_at).total_seconds() if last else None  # seconds since the last cycle (s)
         if last is None or elapsed_s >= kbs.cycle_seconds:
             run_kbs_cycle_for_org.delay(kbs.organization_id)
             due += 1

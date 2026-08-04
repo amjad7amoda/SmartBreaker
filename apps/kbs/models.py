@@ -8,6 +8,8 @@ from django.utils import timezone
 from apps.breakers.models import Breaker
 from apps.organizations.models import Organization
 
+from .contracts import TIER2_ENGINE
+
 
 class KBSSettings(models.Model):
     MODE_CHOICES = [('observing', 'Observing'), ('active', 'Active')]
@@ -116,7 +118,7 @@ class KBSDecision(models.Model):
     event_type = models.CharField(
         max_length=20, choices=EVENT_TYPE_CHOICES, default='decision'
     )
-    engine = models.CharField(max_length=150, default='apps.kbs.engine.rules.decide')
+    engine = models.CharField(max_length=150, default=TIER2_ENGINE)
     branch = models.CharField(max_length=100, blank=True)
     facts = models.JSONField(default=dict)
     trace_version = models.PositiveSmallIntegerField(default=1)

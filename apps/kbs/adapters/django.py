@@ -8,6 +8,7 @@ from django.utils import timezone
 from apps.breakers.models import Breaker, BreakerReading
 from apps.telemetry.models import Reading
 
+from ..contracts import TIER2_ENGINE
 from ..engine.derived import (
     hours_until, is_daytime, is_sudden_draw, is_sudden_drop,
     joule_deficit_J, mean, ramped_threshold,
@@ -189,7 +190,7 @@ class DjangoKBSAdapter:
         decision = KBSDecision.objects.create(
             organization=organization,
             tier='tier2', event_type='decision',
-            engine='apps.kbs.engine.rules.decide',
+            engine=TIER2_ENGINE,
             branch=result.branch,
             facts=facts_to_dict(facts),
             trace_version=result.trace_version,

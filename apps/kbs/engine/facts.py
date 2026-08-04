@@ -1,8 +1,4 @@
-"""Pure, immutable inputs for the Tier-2 decision engine.
-
-Backend adapters are responsible for constructing these facts. This module
-deliberately has no Django, database, clock, network, or service imports.
-"""
+"""Pure, immutable inputs for the Tier-2 decision engine."""
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, time
@@ -46,10 +42,7 @@ class BreakerFacts:
     def expected_draw_W(self, motor_peak_minutes):
         in_peak_phase = (
             self.load_type == 'motor'
-            and (
-                self.minutes_since_on is None
-                or self.minutes_since_on < motor_peak_minutes
-            )
+            and (self.minutes_since_on is None or self.minutes_since_on < motor_peak_minutes)
         )
         if in_peak_phase and self.peak_load_W is not None:
             return self.peak_load_W
@@ -108,10 +101,18 @@ class SystemFacts:
     mandatory_need_Wh: float
     motor_peak_minutes: int
     breakers: tuple[BreakerFacts, ...]
+    # Raw thresholds are retained alongside derived booleans so audit traces
+    # show the comparison that was actually made.
+    battery_low_threshold_V: float | None = None
+    heatsink_temp_limit_C: float | None = None
+    joule_deficit_limit_J: float | None = None
+    grid_present_min_V: float | None = None
+    sudden_drop_fraction: float | None = None
+    sudden_draw_W: float | None = None
+    pv_day_min_W: float | None = None
 
 
 def facts_to_dict(facts):
-    """Return a JSON-safe primitive snapshot for the audit adapter."""
     return _jsonable(asdict(facts))
 
 

@@ -1,0 +1,11 @@
+diff --git a/apps/kbs/engine/rules.py b/apps/kbs/engine/rules.py
+--- a/apps/kbs/engine/rules.py
++++ b/apps/kbs/engine/rules.py
+@@ -60,5 +60,5 @@ def _finish(result, trace):
+               action=action.action, countdown_s=action.countdown_s, reason=action.reason,
+         )
+     for alert in result.alerts:
+         _step(trace, 'tier2.output.alert', 'alert', 'emitted', alert.message,
+-              kind=alert.kind, severity=alert.severity)
++              alert_kind=alert.kind, severity=alert.severity)
+     result.trace_version = TRACE_VERSION

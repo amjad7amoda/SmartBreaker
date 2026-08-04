@@ -38,10 +38,15 @@ def _org_or_none(request, from_query=True):
 def _action_dict(action):
     return {
         'id': action.id,
-        'device_id': action.breaker.device_id,
+        'action_id': str(action.action_id),
+        'device_id': action.device_id,
         'action': action.action,
         'countdown_s': action.countdown_s,
         'reason': action.reason,
+        'status': action.status,
+        'resulting_state': action.resulting_state,
+        'executed_at': action.executed_at,
+        'failure_reason': action.failure_reason,
         'branch': action.decision.branch,
         'created_at': action.created_at,
     }
@@ -131,7 +136,10 @@ class RunCycleView(APIView):
             })
         return Response({
             'engine': 'apps.kbs.services.run_cycle',
+            'event_id': str(decision.event_id),
             'branch': decision.branch,
+            'trace_version': decision.trace_version,
+            'trace': decision.trace,
             'created_at': decision.created_at,
             'facts': decision.facts,
             'actions': [_action_dict(a) for a in decision.actions.select_related('breaker', 'decision')],
@@ -152,13 +160,13 @@ class SimStateView(APIView):
         newest_per_breaker = {}
         for action in (
             BreakerAction.objects
-            .filter(breaker__organization=org, executed=False)
+            .filter(decision__organization=org, status__in=('pending', 'scheduled'))
             .select_related('breaker', 'decision')
             .order_by('created_at')
         ):
-            newest_per_breaker[action.breaker_id] = action
+            newest_per_breaker[action.device_id] = action
         pending = sorted(newest_per_breaker.values(), key=lambda action: action.created_at)
-        alerts = Alert.objects.filter(organization=org)[:10]
+        alerts = Alert.objects.filter(organization=org, suppressed=False)[:10]
         latest_reading = Reading.objects.filter(organization=org).first()
         breakers = Breaker.objects.filter(organization=org).select_related('status')
         return Response({
@@ -179,8 +187,12 @@ class SimStateView(APIView):
             },
             'latest_decision': (
                 {
-                    'engine': 'apps.kbs.services.run_cycle',
+                    'event_id': str(latest.event_id),
+                    'engine': latest.engine,
+                    'tier': latest.tier,
                     'branch': latest.branch,
+                    'trace_version': latest.trace_version,
+                    'trace': latest.trace,
                     'created_at': latest.created_at,
                     'facts': latest.facts,
                 } if latest else None
@@ -198,7 +210,26 @@ class AckActionsView(APIView):
 
     def post(self, request):
         ids = request.data.get('action_ids', [])
-        updated = BreakerAction.objects.filter(id__in=ids, executed=False).update(executed=True)
+        updated = 0
+        for action in BreakerAction.objects.filter(id__in=ids):
+            action.status = 'applied'
+            action.resulting_state = action.action == 'on'
+            action.executed_at = timezone.now()
+            action.save()
+            updated += 1
+        for payload in request.data.get('results', []):
+            if payload.get('id'):
+                action = BreakerAction.objects.filter(id=payload['id']).first()
+            else:
+                action = BreakerAction.objects.filter(action_id=payload.get('action_id')).first()
+            if action is None:
+                continue
+            action.status = payload.get('status', action.status)
+            action.resulting_state = payload.get('resulting_state', action.resulting_state)
+            action.failure_reason = str(payload.get('failure_reason') or '')[:500]
+            action.executed_at = timezone.now()
+            action.save()
+            updated += 1
         return Response({'acknowledged': updated})
 
 

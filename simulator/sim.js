@@ -110,6 +110,12 @@ const state = {
     sequence: 0,           // stable newest-first row id (count)
     lastTier1FactsRealMs: 0, // throttle repetitive Tier-1 fact snapshots (ms)
   },
+  decisionLogs: {
+    token: '',
+    tier: '',
+    entries: [],
+    loading: false,
+  },
 
   lastRealMs: performance.now(), // real timestamp of the previous tick (ms)
 };
@@ -609,11 +615,26 @@ async function tier1Loop(flow) {
   }
 }
 
+function reportTier1Action(command, status, resultingState = null, failureReason = '') {
+  if (!command.action_id) return;
+  fetch(`${state.tier1.baseUrl}/action-result`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action_id: command.action_id, status, resulting_state: resultingState,
+      failure_reason: failureReason, executed_at: new Date().toISOString(),
+    }),
+  }).catch(() => {});
+}
+
 function applyTier1Commands(commands) {
   let changed = false;
   for (const command of commands) {
     const b = state.breakers.find((item) => item.deviceId === command.device_id);
-    if (!b) continue;
+    if (!b) {
+      reportTier1Action(command, 'failed', null, 'breaker not present in simulator');
+      continue;
+    }
+    const wasOn = b.switchOn;
     scenarioObserve('tier1_command', { ...command });
     evidenceLog(
       'T1', 'COMMAND',
@@ -629,11 +650,12 @@ function applyTier1Commands(commands) {
         state.kbs.countdowns.push({
           source: 'T1', deviceId: command.device_id,
           fireAtSimMs: state.simMs + command.countdown_s * 1000,
-          reason: command.reason, actionId: null,
+          reason: command.reason, actionId: command.action_id,
         });
         tier1Log(`OFF in ${Math.round(command.countdown_s / 60)} min — ${command.device_id} — ${command.reason}`, 'action');
         evidenceLog('EXECUTOR', 'SCHEDULED', `Tier-1 countdown armed for ${command.device_id}`, command);
       }
+      reportTier1Action(command, armed ? 'suppressed_duplicate' : 'scheduled', b.switchOn);
       continue;
     }
     if (command.action === 'off' && b.switchOn) {
@@ -648,6 +670,7 @@ function applyTier1Commands(commands) {
       evidenceLog('EXECUTOR', 'APPLIED', `Applied Tier-1 command: ${command.device_id} ON`, command);
       changed = true;
     }
+    reportTier1Action(command, wasOn === b.switchOn ? 'noop' : 'applied', b.switchOn);
   }
   if (changed) renderBreakerTable();
 }
@@ -717,6 +740,88 @@ function renderEvidence() {
       `<td><div class="evidence-summary">${escapeHtml(entry.summary)}</div>${raw}</td>` +
       `</tr>`;
   }).join('');
+}
+
+// ============================= saved decision logs =======================
+
+function renderDecisionLogs() {
+  const cards = $('decision-log-cards');
+  if (!cards) return;
+  cards.innerHTML = state.decisionLogs.entries.map((entry) => {
+    const legacy = entry.trace_version === 0;
+    const steps = (entry.trace ?? []).map((step) =>
+      `<li class="decision-step">` +
+      `<span class="decision-outcome ${escapeHtml(step.outcome)}">${escapeHtml(step.outcome)}</span>` +
+      `<span class="decision-step-code">${escapeHtml(step.code)}</span>` +
+      `<span class="decision-step-summary">${escapeHtml(step.summary)}</span>` +
+      `</li>`
+    ).join('');
+    const actions = (entry.actions ?? []).map((action) =>
+      `<span class="decision-action ${escapeHtml(action.status)}">` +
+      `${escapeHtml(action.device_id)} → ${escapeHtml(action.action.toUpperCase())}` +
+      `${action.countdown_s ? ` in ${action.countdown_s}s` : ''} · ${escapeHtml(action.status)}` +
+      `</span>`
+    ).join('');
+    const uploadBadge = entry.tier === 'tier1'
+      ? `<span class="decision-badge uploaded">uploaded</span>` : '';
+    return `<article class="decision-card">` +
+      `<div class="decision-card-head"><div>` +
+      `<div class="decision-card-title">${escapeHtml(entry.branch || entry.event_type)}</div>` +
+      `<div class="decision-card-meta">${escapeHtml(entry.organization?.name ?? '')} · ` +
+      `${escapeHtml(new Date(entry.occurred_at).toLocaleString())} · ${escapeHtml(entry.engine)}</div>` +
+      `</div><div class="decision-card-badges">` +
+      `<span class="decision-badge ${escapeHtml(entry.tier)}">${escapeHtml(entry.tier)}</span>` +
+      `<span class="decision-badge">${escapeHtml(entry.event_type)}</span>${uploadBadge}` +
+      `${legacy ? '<span class="decision-badge legacy">legacy</span>' : ''}` +
+      `</div></div>` +
+      (legacy
+        ? '<div class="decision-legacy-note">Legacy record — detailed path was not captured.</div>'
+        : `<ol class="decision-timeline">${steps}</ol>`) +
+      `<div class="decision-actions">${actions || '<span class="decision-action">No breaker action</span>'}</div>` +
+      `<details class="decision-raw"><summary>Raw JSON</summary>` +
+      `<pre>${escapeHtml(JSON.stringify(entry, null, 2))}</pre></details>` +
+      `</article>`;
+  }).join('');
+}
+
+async function loadDecisionLogs() {
+  if (state.decisionLogs.loading) return;
+  const token = $('inp-decision-token')?.value.trim() ?? '';
+  const status = $('decision-log-status');
+  if (!token) {
+    status.textContent = 'A JWT access token is required to read saved decision logs.';
+    return;
+  }
+  state.decisionLogs.loading = true;
+  state.decisionLogs.token = token;
+  state.decisionLogs.tier = $('inp-decision-tier')?.value ?? '';
+  status.textContent = 'Loading saved decisions…';
+  try {
+    const query = new URLSearchParams({
+      organization: String(state.push.orgId), page_size: '12',
+    });
+    if (state.decisionLogs.tier) query.set('tier', state.decisionLogs.tier);
+    const headers = { Authorization: `Bearer ${token}` };
+    const response = await fetch(
+      `${state.push.baseUrl}/api/kbs/decision-logs/?${query}`, { headers },
+    );
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail ?? `history HTTP ${response.status}`);
+    const summaries = body.results ?? [];
+    state.decisionLogs.entries = await Promise.all(summaries.map(async (summary) => {
+      const detailResponse = await fetch(
+        `${state.push.baseUrl}/api/kbs/decision-logs/${summary.event_id}/`, { headers },
+      );
+      if (!detailResponse.ok) return summary;
+      return detailResponse.json();
+    }));
+    status.textContent = `${body.count ?? summaries.length} saved decision(s); showing ${summaries.length}.`;
+    renderDecisionLogs();
+  } catch (error) {
+    status.textContent = `Could not load saved decisions: ${error.message}`;
+  } finally {
+    state.decisionLogs.loading = false;
+  }
 }
 
 // ============================= KBS closed loop ============================
@@ -865,6 +970,11 @@ function kbsCountdownCheck() {
           reason: c.reason,
         });
       }
+    }
+    if (c.source === 'T1') {
+      reportTier1Action(
+        { action_id: c.actionId }, b && !b.switchOn ? 'applied' : 'noop', b?.switchOn ?? null,
+      );
     }
   }
   const tier2Ids = due.filter((c) => c.source === 'T2' && c.actionId).map((c) => c.actionId);
@@ -1264,6 +1374,12 @@ function initControls() {
 }
 
 // ============================= scenario runner ============================
+
+  $('btn-decision-logs-refresh')?.addEventListener('click', loadDecisionLogs);
+  $('inp-decision-tier')?.addEventListener('change', loadDecisionLogs);
+  $('inp-decision-token')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') loadDecisionLogs();
+  });
 
 function freshScenarioObservations() {
   return {

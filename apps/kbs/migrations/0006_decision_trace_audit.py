@@ -9,6 +9,7 @@ def backfill_legacy_records(apps, schema_editor):
     Decision = apps.get_model('kbs', 'KBSDecision')
     Action = apps.get_model('kbs', 'BreakerAction')
     for decision in Decision.objects.all().iterator():
+        decision.event_id = uuid.uuid4()
         decision.tier = 'tier2'
         decision.event_type = 'decision'
         decision.engine = 'legacy.apps.kbs.services.run_cycle'
@@ -16,13 +17,17 @@ def backfill_legacy_records(apps, schema_editor):
         decision.trace = []
         decision.occurred_at = decision.created_at
         decision.save(update_fields=[
-            'tier', 'event_type', 'engine', 'trace_version', 'trace', 'occurred_at',
+            'event_id', 'tier', 'event_type', 'engine', 'trace_version', 'trace',
+            'occurred_at',
         ])
     for action in Action.objects.select_related('breaker').all().iterator():
+        action.action_id = uuid.uuid4()
         action.device_id = action.breaker.device_id if action.breaker_id else ''
         action.status = 'applied' if action.executed else 'pending'
         action.executed_at = action.created_at if action.executed else None
-        action.save(update_fields=['device_id', 'status', 'executed_at'])
+        action.save(update_fields=[
+            'action_id', 'device_id', 'status', 'executed_at',
+        ])
 
 
 class Migration(migrations.Migration):
@@ -48,14 +53,16 @@ class Migration(migrations.Migration):
         migrations.AddField('alert', 'decision', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='alerts', to='kbs.kbsdecision')),
         migrations.AddField('alert', 'suppressed', models.BooleanField(default=False)),
         migrations.AddField('alert', 'suppression_reason', models.CharField(blank=True, max_length=255)),
-        migrations.AddField('breakeraction', 'action_id', models.UUIDField(default=uuid.uuid4, editable=False, unique=True)),
+        # Nullable/non-unique first: callable defaults are evaluated only once
+        # when a field is added, so populated installations need a per-row pass.
+        migrations.AddField('breakeraction', 'action_id', models.UUIDField(editable=False, null=True)),
         migrations.AddField('breakeraction', 'device_id', models.CharField(default='', max_length=100), preserve_default=False),
         migrations.AddField('breakeraction', 'executed_at', models.DateTimeField(blank=True, null=True)),
         migrations.AddField('breakeraction', 'failure_reason', models.CharField(blank=True, max_length=500)),
         migrations.AddField('breakeraction', 'resulting_state', models.BooleanField(blank=True, null=True)),
         migrations.AddField('breakeraction', 'status', models.CharField(choices=[('pending', 'Pending'), ('scheduled', 'Scheduled'), ('applied', 'Applied'), ('blocked', 'Blocked'), ('failed', 'Failed'), ('noop', 'No-op'), ('suppressed_duplicate', 'Suppressed duplicate')], default='pending', max_length=30)),
         migrations.AddField('kbsdecision', 'engine', models.CharField(default='apps.kbs.engine.rules.decide', max_length=150)),
-        migrations.AddField('kbsdecision', 'event_id', models.UUIDField(default=uuid.uuid4, editable=False, unique=True)),
+        migrations.AddField('kbsdecision', 'event_id', models.UUIDField(editable=False, null=True)),
         migrations.AddField('kbsdecision', 'event_type', models.CharField(choices=[('decision', 'Decision'), ('clear', 'Clear'), ('error', 'Error')], default='decision', max_length=20)),
         migrations.AddField('kbsdecision', 'occurred_at', models.DateTimeField(default=django.utils.timezone.now)),
         migrations.AddField('kbsdecision', 'received_at', models.DateTimeField(auto_now_add=True, default=django.utils.timezone.now), preserve_default=False),
@@ -63,6 +70,8 @@ class Migration(migrations.Migration):
         migrations.AddField('kbsdecision', 'trace', models.JSONField(default=list)),
         migrations.AddField('kbsdecision', 'trace_version', models.PositiveSmallIntegerField(default=1)),
         migrations.RunPython(backfill_legacy_records, migrations.RunPython.noop),
+        migrations.AlterField('breakeraction', 'action_id', models.UUIDField(default=uuid.uuid4, editable=False, unique=True)),
+        migrations.AlterField('kbsdecision', 'event_id', models.UUIDField(default=uuid.uuid4, editable=False, unique=True)),
         migrations.AlterField('breakeraction', 'breaker', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='kbs_actions', to='breakers.breaker')),
         migrations.AlterField('kbsdecision', 'branch', models.CharField(blank=True, max_length=100)),
         migrations.AlterModelOptions(name='kbsdecision', options={'ordering': ['-occurred_at', '-received_at']}),

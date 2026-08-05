@@ -56,6 +56,13 @@ class OverloadTests(unittest.TestCase):
         self.assertEqual(result.situation, 'inverter_overload')
         self.assertEqual(off_ids(result), ['tv'])   # fridge survives — no blackout for a mild overload
 
+    def test_rating_boundary_matches_tier2(self):
+        cfg = Tier1Config(max_inverter_power_W=4000)
+        result = evaluate(
+            InverterState(ac_output_active_power_W=4000), site(), cfg,
+        )
+        self.assertEqual(result.situation, 'inverter_overload')
+
     def test_mild_load_does_nothing(self):
         inv = InverterState(ac_output_active_power_W=1200)
         self.assertEqual(evaluate(inv, site()).situation, '')  # 1200 W on the 5000 W default: fine

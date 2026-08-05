@@ -12,7 +12,7 @@ from apps.breakers.models import Breaker
 from apps.organizations.models import Organization
 
 from .models import (
-    BreakerAction, EdgeDevice, KBSDecision, Tier1SafetyState,
+    BreakerAction, EdgeDevice, KBSDecision, KBSSettings, Tier1SafetyState,
 )
 
 
@@ -124,6 +124,33 @@ class DecisionAuditApiTests(APITestCase):
         self.assertTrue(safety.active)
         self.assertEqual(safety.situation, 'inverter_overheat')
         self.assertEqual(safety.commands[0]['device_id'], self.breaker.device_id)
+
+    def test_edge_config_uses_tier2_site_settings(self):
+        settings, _ = KBSSettings.objects.update_or_create(
+            organization=self.organization,
+            defaults={
+                'max_inverter_power_W': 4000,
+                'heatsink_temp_limit_C': 68,
+                'battery_low_voltage_V': 23.5,
+            },
+        )
+
+        unauthorized = self.client.get('/api/kbs/edge/tier1-config/')
+        response = self.client.get(
+            '/api/kbs/edge/tier1-config/', **self._device_headers(),
+        )
+
+        self.assertIn(unauthorized.status_code, (401, 403))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['version'], 1)
+        self.assertEqual(response.json()['config']['max_inverter_power_W'], 4000)
+        self.assertEqual(response.json()['config']['overload_fraction'], 1.0)
+        self.assertEqual(response.json()['config']['heatsink_temp_limit_C'], 68)
+        self.assertEqual(response.json()['config']['battery_low_voltage_V'], 23.5)
+        self.assertEqual(
+            response.json()['updated_at'],
+            settings.updated_at.isoformat().replace('+00:00', 'Z'),
+        )
 
     def test_danger_supersedes_unresolved_tier2_actions(self):
         tier2 = KBSDecision.objects.create(

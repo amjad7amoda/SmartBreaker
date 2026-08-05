@@ -2,7 +2,7 @@ from django.urls import path
 
 from .audit_views import (
     DecisionLogDetailView, DecisionLogListView,
-    EdgeActionResultsView, EdgeDecisionEventsView,
+    EdgeActionResultsView, EdgeDecisionEventsView, EdgeTier1ConfigView,
 )
 from .views import (
     AckActionsView, BreakerOverrideView, ClimateView, RunCycleView,
@@ -10,6 +10,7 @@ from .views import (
 )
 
 urlpatterns = [
+    path('edge/tier1-config/', EdgeTier1ConfigView.as_view(), name='kbs-edge-tier1-config'),
     path('edge/decision-events/', EdgeDecisionEventsView.as_view(), name='kbs-edge-decision-events'),
     path('edge/action-results/', EdgeActionResultsView.as_view(), name='kbs-edge-action-results'),
     path('decision-logs/', DecisionLogListView.as_view(), name='kbs-decision-logs'),

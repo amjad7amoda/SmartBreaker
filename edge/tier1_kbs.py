@@ -20,7 +20,9 @@ def _step(trace, code, kind, outcome, summary, **evidence):
 class Tier1Config:
     heatsink_temp_limit_C: float = 70.0
     max_inverter_power_W: float = 5000.0
-    overload_fraction: float = 1.05
+    # Tier-2 defines overload at the configured inverter rating. Keep the
+    # dependency-free Tier-1 evaluator on that same boundary by default.
+    overload_fraction: float = 1.0
     battery_low_voltage_V: float = 24.0
     battery_low_margin_V: float = 0.5
     battery_critical_margin_V: float = 0.1

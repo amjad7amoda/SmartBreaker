@@ -14,7 +14,8 @@ from apps.organizations.models import Organization
 
 from .authentication import DeviceAuthentication
 from .models import (
-    Alert, BreakerAction, EdgeDevice, KBSDecision, Tier1SafetyState,
+    Alert, BreakerAction, EdgeDevice, KBSDecision, KBSSettings,
+    Tier1SafetyState,
 )
 
 
@@ -25,6 +26,44 @@ EVENT_TYPES = {choice[0] for choice in KBSDecision.EVENT_TYPE_CHOICES}
 class IsEdgeDevice(BasePermission):
     def has_permission(self, request, view):
         return isinstance(request.auth, EdgeDevice) and request.auth.status == 'active'
+
+
+def _tier1_config_data(settings):
+    """Translate the shared site settings into the dependency-free Tier-1 contract."""
+    return {
+        'heatsink_temp_limit_C': settings.heatsink_temp_limit_C,
+        'max_inverter_power_W': settings.max_inverter_power_W,
+        # Tier-2 defines live overload at the inverter rating. Tier-1 uses the
+        # same boundary so both tiers classify the same load consistently.
+        'overload_fraction': 1.0,
+        'battery_low_voltage_V': settings.battery_low_voltage_V,
+        'battery_low_margin_V': settings.battery_low_margin_V,
+        'battery_critical_margin_V': 0.1,
+        'battery_capacity_Wh': settings.battery_capacity_Wh,
+        'battery_shutdown_buffer_percent': settings.battery_shutdown_buffer_percent,
+        'grid_present_min_V': settings.grid_present_min_V,
+        'charge_current_idle_A': 0.5,
+        'countdown_min_s': 60,
+        'countdown_max_s': 3600,
+    }
+
+
+class EdgeTier1ConfigView(APIView):
+    """Return the organization's authoritative safety thresholds to its edge."""
+
+    authentication_classes = [DeviceAuthentication]
+    permission_classes = [IsEdgeDevice]
+
+    def get(self, request):
+        settings, _ = KBSSettings.objects.get_or_create(
+            organization=request.auth.organization,
+        )
+        EdgeDevice.objects.filter(pk=request.auth.pk).update(last_seen_at=timezone.now())
+        return Response({
+            'version': 1,
+            'updated_at': settings.updated_at,
+            'config': _tier1_config_data(settings),
+        })
 
 
 def _iso_datetime(value, field):

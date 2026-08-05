@@ -20,6 +20,8 @@ decision already made by the existing Tier 1 KBS.
 
 The change covers:
 
+- A single backend-owned set of safety thresholds shared by Tier 1 and Tier 2.
+- Equal inverter-overload classification at the configured inverter rating.
 - Tier 1 danger lifetime and clear behavior.
 - Durable backend storage of the latest Tier 1 safety state.
 - Ordered and idempotent Tier 1 event ingestion.
@@ -100,10 +102,43 @@ Tier 2 behavior is:
 
 ## Tier 1 KBS changes
 
-The Tier 1 KBS was already danger-only. Its rule ordering and thresholds remain
-unchanged.
+The Tier 1 KBS remains danger-only. Its danger precedence is unchanged, but its
+overload boundary and configuration source now agree with Tier 2.
 
-Two false-clear paths were corrected in edge/tier1_kbs.py.
+### Authoritative configuration parity
+
+Previously, the Tier 1 bridge accepted its complete safety configuration from
+each evaluation request while Tier 2 read KBSSettings from the backend. A
+request could therefore evaluate Tier 1 with a 1000 W inverter rating while
+Tier 2 evaluated the same organization with a 4000 W rating.
+
+The backend is now the authoritative source for the shared site thresholds. An
+authenticated edge device reads GET /api/kbs/edge/tier1-config/. The response
+is derived from the same KBSSettings row used to build Tier 2 facts and
+contains the inverter rating, thermal limit, battery limits and capacity, grid
+voltage threshold, and countdown constants consumed by Tier 1.
+
+The Tier 1 bridge:
+
+1. validates the request structure;
+2. reads and caches the backend configuration for 30 seconds;
+3. overlays the backend values on request-provided values;
+4. evaluates the dependency-free Tier 1 KBS; and
+5. records the resolved configuration in the immutable audit facts.
+
+The overload fraction now defaults to 1.0. Consequently both engines classify
+live inverter overload at:
+
+~~~text
+load_power_W >= max_inverter_power_W
+~~~
+
+If the backend is temporarily unavailable after a successful fetch, the bridge
+keeps using its last known good configuration. If no configuration has ever
+been fetched, it falls back to the locally supplied values so Tier 1 can still
+operate offline.
+
+Two additional false-clear paths were corrected in edge/tier1_kbs.py.
 
 ### Low battery
 
@@ -285,6 +320,33 @@ response.
 
 ## API changes
 
+GET /api/kbs/edge/tier1-config/ uses Device authentication and returns the
+organization's Tier 1 projection of KBSSettings:
+
+~~~json
+{
+  "version": 1,
+  "updated_at": "...",
+  "config": {
+    "heatsink_temp_limit_C": 70.0,
+    "max_inverter_power_W": 4000.0,
+    "overload_fraction": 1.0,
+    "battery_low_voltage_V": 24.0,
+    "battery_low_margin_V": 0.5,
+    "battery_critical_margin_V": 0.1,
+    "battery_capacity_Wh": 5000.0,
+    "battery_shutdown_buffer_percent": 2.0,
+    "grid_present_min_V": 100.0,
+    "charge_current_idle_A": 0.5,
+    "countdown_min_s": 60,
+    "countdown_max_s": 3600
+  }
+}
+~~~
+
+The endpoint is organization-scoped by the authenticated edge credential. A
+browser or edge device cannot select another organization in the request.
+
 GET /api/kbs/sim/state/ now includes tier1_safety:
 
 ~~~json
@@ -324,7 +386,7 @@ organization along with its run history.
 | --- | --- |
 | Normal | No active hold; original Tier 2 rules and grouping run |
 | Inverter overheat | Tier 2 bypasses comfort restoration and mirrors Tier 1 OFF targets |
-| Inverter overload | Tier 2 cannot create the ON step that caused OFF/ON/OFF oscillation |
+| Inverter overload | Both tiers use the same rating; while the hold is active Tier 2 mirrors Tier 1 OFF targets |
 | Battery critical | Tier 2 mirrors the immediate Tier 1 safety target |
 | Low-battery countdown | Tier 2 mirrors countdown metadata; duplicate execution is suppressed |
 | Grid outage with thin battery | Hold remains active at zero grid voltage even after all eligible loads are off |
@@ -346,6 +408,13 @@ facts.
 
 ### The edge is temporarily offline
 
+Tier 1 evaluation does not require a live backend connection. The bridge uses
+the last successfully fetched KBS configuration. On a fresh offline start it
+uses the locally provisioned/requested configuration and reports
+request_fallback in GET /health until backend configuration becomes available.
+
+For the safety interlock, the backend behavior is unchanged:
+
 The last confirmed safety state remains active. There is deliberately no
 timeout-based automatic clear because losing contact with Tier 1 is not proof
 that the physical danger ended.
@@ -360,9 +429,13 @@ advance the live safety state.
 ### Tier 1
 
 - edge/tier1_kbs.py: keep low-battery and grid-outage situations active when no
-  more commands are needed.
+  more commands are needed; align the default overload boundary with Tier 2.
+- edge/simulator_bridge.py: fetch, cache, apply, and expose the source of the
+  backend-owned Tier 1 configuration.
+- edge/test_simulator_bridge.py: prove a request's stale 1000 W value is
+  replaced by the backend's 4000 W value.
+- edge/test_tier1_kbs.py: overload-boundary and danger-persistence tests.
 - edge/audit.py: align supported action statuses.
-- edge/test_tier1_kbs.py: danger-persistence tests.
 - edge/test_audit.py: transition test proving an empty command list does not
   cause a false clear.
 
@@ -372,7 +445,9 @@ advance the live safety state.
 - apps/kbs/migrations/0008_tier1_safety_interlock.py: schema and live-state
   backfill.
 - apps/kbs/audit_views.py: ordered state advancement, stale-action
-  supersession, result reconciliation, and terminal-state protection.
+  supersession, result reconciliation, terminal-state protection, and the
+  device-authenticated Tier 1 configuration endpoint.
+- apps/kbs/urls.py: route the edge configuration endpoint.
 - apps/kbs/interlock.py: pure Tier 1 decision mirroring contract.
 - apps/kbs/adapters/django.py: pre-decision gate and transactional recheck.
 - apps/kbs/services.py: adapter decision hook.
@@ -405,13 +480,17 @@ deployment, confirm:
 3. Tier 2 interlock decisions use the tier1_interlock branch prefix.
 4. Superseded actions no longer appear in pending_actions.
 5. A Tier 1 clear is followed by a fresh normal Tier 2 cycle.
+6. GET /api/kbs/edge/tier1-config/ returns the same inverter rating used by
+   Tier 2.
+7. GET http://127.0.0.1:8788/health reports config.source as backend after
+   bridge startup.
 
 ## Verification
 
 The implemented test coverage includes:
 
-- 24 dependency-free Tier 1 tests.
-- 72 Django KBS tests.
+- 26 dependency-free Tier 1 and bridge/audit tests.
+- 73 Django KBS tests.
 - Django model/migration consistency checks.
 - Django system checks.
 

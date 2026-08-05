@@ -13,7 +13,10 @@ from apps.organizations.models import Organization
 from apps.telemetry.models import Reading
 
 from .climate import ClimateDataError, load_climate_rows
-from .models import Alert, BreakerAction, KBSDecision, KBSSettings, ScheduledEvent
+from .models import (
+    Alert, BreakerAction, KBSDecision, KBSSettings, ScheduledEvent,
+    Tier1SafetyState,
+)
 
 
 class ClimateDataTests(APITestCase):
@@ -120,6 +123,7 @@ class SimulatorApiTests(APITestCase):
         self.assertEqual(body['latest_telemetry']['pv_charging_power_W'], 1500)
         self.assertEqual(body['metadata']['engine'], 'apps.kbs.services.run_cycle')
         self.assertEqual(body['settings']['max_inverter_power_W'], 5000)
+        self.assertFalse(body['tier1_safety']['active'])
         self.assertEqual(body['breakers'][0]['device_id'], 'sim-api-load')
         self.assertTrue(body['breakers'][0]['locked_out'])
         self.assertEqual(len(body['pending_actions']), 1)
@@ -132,6 +136,12 @@ class SimulatorApiTests(APITestCase):
         self.assertTrue(Reading.objects.filter(organization=self.sim_org).exists())
 
     def test_reset_is_scoped_and_preserves_definitions_settings_and_events(self):
+        Tier1SafetyState.objects.create(
+            organization=self.sim_org,
+            active=True,
+            situation='inverter_overheat',
+            commands=[],
+        )
         response = self.client.post(
             '/api/kbs/sim/reset/', {'organization': self.sim_org.id, 'confirm': True}, format='json',
         )
@@ -140,6 +150,9 @@ class SimulatorApiTests(APITestCase):
         self.assertFalse(BreakerReading.objects.filter(breaker=self.breaker).exists())
         self.assertFalse(KBSDecision.objects.filter(organization=self.sim_org).exists())
         self.assertFalse(Alert.objects.filter(organization=self.sim_org).exists())
+        self.assertFalse(Tier1SafetyState.objects.filter(
+            organization=self.sim_org,
+        ).exists())
         self.assertTrue(Reading.objects.filter(organization=self.other_org).exists())
         self.assertTrue(Alert.objects.filter(organization=self.other_org).exists())
         self.assertTrue(Breaker.objects.filter(pk=self.breaker.pk).exists())
@@ -180,3 +193,23 @@ class SimulatorApiTests(APITestCase):
         }, format='json')
         self.assertEqual(response.status_code, 404)
         self.assertTrue(BreakerStatus.objects.get(breaker=self.other_breaker).switch)
+
+    def test_ack_cannot_revive_a_superseded_action(self):
+        action = BreakerAction.objects.get(
+            decision__organization=self.sim_org,
+        )
+        action.status = 'superseded'
+        action.failure_reason = 'Tier-1 safety started'
+        action.save()
+
+        response = self.client.post(
+            '/api/kbs/sim/ack/',
+            {'action_ids': [action.id]},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['acknowledged'], 0)
+        self.assertEqual(response.json()['ignored_resolved'], 1)
+        action.refresh_from_db()
+        self.assertEqual(action.status, 'superseded')

@@ -10,9 +10,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.breakers.models import Breaker
+from apps.organizations.models import Organization
 
 from .authentication import DeviceAuthentication
-from .models import Alert, BreakerAction, EdgeDevice, KBSDecision
+from .models import (
+    Alert, BreakerAction, EdgeDevice, KBSDecision, Tier1SafetyState,
+)
 
 
 ACTION_STATUSES = {choice[0] for choice in BreakerAction.STATUS_CHOICES}
@@ -48,6 +51,10 @@ def _set_action_result(action, payload):
     status = payload.get('status')
     if status not in ACTION_STATUSES:
         raise ValueError(f'unknown action status: {status}')
+    if action.status in BreakerAction.RESOLVED_STATUSES and status != action.status:
+        raise ValueError(
+            f'resolved action cannot change from {action.status} to {status}'
+        )
     action.status = status
     if 'resulting_state' in payload:
         state = payload['resulting_state']
@@ -57,7 +64,7 @@ def _set_action_result(action, payload):
     action.failure_reason = str(payload.get('failure_reason') or '')[:500]
     if payload.get('executed_at'):
         action.executed_at = _iso_datetime(payload['executed_at'], 'executed_at')
-    elif _resolved(status):
+    elif _resolved(status) and action.executed_at is None:
         action.executed_at = timezone.now()
     action.save()
 
@@ -86,6 +93,9 @@ class EdgeDecisionEventsView(APIView):
     def _ingest(self, device, payload):
         if not isinstance(payload, dict):
             raise ValueError('each event must be a JSON object')
+        organization = Organization.objects.select_for_update().get(
+            pk=device.organization_id,
+        )
         event_id = _uuid(payload.get('event_id'), 'event_id')
         event_type = payload.get('event_type', 'decision')
         if event_type not in EVENT_TYPES:
@@ -98,7 +108,7 @@ class EdgeDecisionEventsView(APIView):
         if not isinstance(trace, list) or not isinstance(facts, dict) or not isinstance(actions, list):
             raise ValueError('trace/actions must be arrays and facts must be an object')
         identity = {
-            'organization': device.organization,
+            'organization': organization,
             'edge_device': device,
             'tier': 'tier1',
             'event_type': event_type,
@@ -133,6 +143,8 @@ class EdgeDecisionEventsView(APIView):
             outcome = 'created'
         for action_payload in actions:
             self._upsert_action(decision, device, action_payload)
+        self._reconcile_confirmed_tier1_actions(decision)
+        self._update_safety_state(decision, device, outcome)
         EdgeDevice.objects.filter(pk=device.pk).update(last_seen_at=timezone.now())
         return {'event_id': str(event_id), 'status': outcome, 'decision_id': decision.pk}
 
@@ -166,6 +178,127 @@ class EdgeDecisionEventsView(APIView):
         if payload.get('status') and payload.get('status') != 'pending':
             _set_action_result(action, payload)
         return action
+
+    @staticmethod
+    def _reconcile_confirmed_tier1_actions(decision):
+        """Resolve Tier-1 actions when a later edge snapshot confirms the target."""
+        raw_breakers = decision.facts.get('breakers', [])
+        if not isinstance(raw_breakers, list):
+            return
+        reported = {}
+        for raw in raw_breakers:
+            if not isinstance(raw, dict) or type(raw.get('switch')) is not bool:
+                continue
+            device_id = str(raw.get('device_id') or '')
+            if device_id:
+                reported[device_id] = raw['switch']
+        if not reported:
+            return
+        unresolved = BreakerAction.objects.filter(
+            decision__organization=decision.organization,
+            decision__tier='tier1',
+            status__in=('pending', 'scheduled'),
+            device_id__in=reported,
+        )
+        for action in unresolved:
+            desired_state = action.action == 'on'
+            if reported[action.device_id] != desired_state:
+                continue
+            BreakerAction.objects.filter(pk=action.pk).update(
+                status='applied',
+                resulting_state=desired_state,
+                executed=True,
+                executed_at=decision.occurred_at,
+                failure_reason='',
+            )
+
+    @staticmethod
+    def _update_safety_state(decision, device, outcome):
+        """Advance the organization safety hold from ordered Tier-1 events."""
+        if decision.event_type == 'error':
+            # Evaluator errors neither invent a danger nor clear an existing
+            # hold. The last confirmed Tier-1 state remains authoritative.
+            return
+        state, _ = Tier1SafetyState.objects.select_for_update().get_or_create(
+            organization=decision.organization,
+        )
+        if state.source_decision_id and state.source_decision_id != decision.id:
+            current_source = state.source_decision
+            current_order = (
+                state.source_occurred_at,
+                current_source.received_at,
+                current_source.pk,
+            )
+            incoming_order = (
+                decision.occurred_at,
+                decision.received_at,
+                decision.pk,
+            )
+            if incoming_order <= current_order:
+                return
+
+        state.edge_device = device
+        state.source_decision = decision
+        state.source_occurred_at = decision.occurred_at
+        if decision.event_type == 'clear':
+            state.active = False
+            state.situation = ''
+            state.commands = []
+            state.cleared_at = decision.occurred_at
+            state.save()
+            return
+        if decision.event_type != 'decision' or not decision.branch:
+            return
+
+        starting_episode = not state.active or state.situation != decision.branch
+        if starting_episode:
+            state.episode_id = uuid.uuid4()
+            state.activated_at = decision.occurred_at
+            state.cleared_at = None
+        state.active = True
+        state.situation = decision.branch
+        incoming_commands = [
+            {
+                'device_id': action.device_id,
+                'action': action.action,
+                'countdown_s': action.countdown_s,
+                'reason': action.reason,
+            }
+            for action in decision.actions.order_by('created_at', 'id')
+        ]
+        if starting_episode:
+            state.commands = incoming_commands
+        else:
+            # A Tier-1 event with no commands means the current physical state
+            # needs no additional command; it must not forget the episode's
+            # desired safety targets. If a breaker is later turned back on,
+            # Tier-2 can therefore reinforce the retained OFF target.
+            merged = {
+                command.get('device_id'): command
+                for command in state.commands
+                if isinstance(command, dict) and command.get('device_id')
+            }
+            for command in incoming_commands:
+                merged[command['device_id']] = command
+            state.commands = list(merged.values())
+        state.save()
+
+        if outcome != 'created':
+            return
+        reason = (
+            f'Superseded by Tier-1 safety episode {state.episode_id}: '
+            f'{state.situation}'
+        )
+        BreakerAction.objects.filter(
+            decision__organization=decision.organization,
+            decision__tier='tier2',
+            status__in=('pending', 'scheduled'),
+        ).update(
+            status='superseded',
+            executed=True,
+            executed_at=timezone.now(),
+            failure_reason=reason[:500],
+        )
 
 
 class EdgeActionResultsView(APIView):

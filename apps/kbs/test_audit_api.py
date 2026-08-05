@@ -1,6 +1,7 @@
 """Persistent decision audit ingestion and history API tests."""
 
 import uuid
+from datetime import timedelta
 
 from django.utils import timezone
 from rest_framework.test import APITestCase
@@ -10,7 +11,9 @@ from apps.accounts.models import User
 from apps.breakers.models import Breaker
 from apps.organizations.models import Organization
 
-from .models import BreakerAction, EdgeDevice, KBSDecision
+from .models import (
+    BreakerAction, EdgeDevice, KBSDecision, Tier1SafetyState,
+)
 
 
 class DecisionAuditApiTests(APITestCase):
@@ -117,6 +120,100 @@ class DecisionAuditApiTests(APITestCase):
         self.assertEqual(decision.organization, self.organization)
         self.assertEqual(decision.tier, 'tier1')
         self.assertEqual(decision.actions.get().device_id, self.breaker.device_id)
+        safety = Tier1SafetyState.objects.get(organization=self.organization)
+        self.assertTrue(safety.active)
+        self.assertEqual(safety.situation, 'inverter_overheat')
+        self.assertEqual(safety.commands[0]['device_id'], self.breaker.device_id)
+
+    def test_danger_supersedes_unresolved_tier2_actions(self):
+        tier2 = KBSDecision.objects.create(
+            organization=self.organization,
+            tier='tier2',
+            branch='day.surplus.comfort_on',
+        )
+        stale = BreakerAction.objects.create(
+            decision=tier2,
+            breaker=self.breaker,
+            device_id=self.breaker.device_id,
+            action='on',
+            reason='stale comfort restoration',
+        )
+
+        response = self._upload(**self._device_headers())
+
+        self.assertEqual(response.json()['results'][0]['status'], 'created')
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, 'superseded')
+        self.assertTrue(stale.executed)
+        self.assertIn('Tier-1 safety episode', stale.failure_reason)
+
+    def test_clear_releases_hold_and_late_old_event_cannot_reactivate_it(self):
+        self._upload(**self._device_headers())
+        clear_payload = {
+            **self.payload,
+            'event_id': str(uuid.uuid4()),
+            'event_type': 'clear',
+            'situation': '',
+            'branch': '',
+            'occurred_at': (timezone.now() + timedelta(seconds=1)).isoformat(),
+            'actions': [],
+            'trace': [{
+                'code': 'tier1.transition.clear',
+                'kind': 'transition',
+                'outcome': 'selected',
+                'summary': 'Danger cleared.',
+                'evidence': {'previous_situation': 'inverter_overheat'},
+            }],
+        }
+
+        cleared = self._upload(clear_payload, **self._device_headers())
+        late_retry = self._upload(**self._device_headers())
+
+        self.assertEqual(cleared.json()['results'][0]['status'], 'created')
+        self.assertEqual(late_retry.json()['results'][0]['status'], 'duplicate')
+        safety = Tier1SafetyState.objects.get(organization=self.organization)
+        self.assertFalse(safety.active)
+        self.assertEqual(safety.situation, '')
+        self.assertEqual(safety.commands, [])
+
+    def test_later_breaker_snapshot_resolves_tier1_pending_action(self):
+        first = {
+            **self.payload,
+            'facts': {
+                'inverter': {'heatsink_temp_C': 80},
+                'breakers': [{
+                    'device_id': self.breaker.device_id,
+                    'switch': True,
+                }],
+            },
+        }
+        self._upload(first, **self._device_headers())
+        confirmation = {
+            **self.payload,
+            'event_id': str(uuid.uuid4()),
+            'action_id': str(uuid.uuid4()),
+            'occurred_at': (timezone.now() + timedelta(seconds=1)).isoformat(),
+            'facts': {
+                'inverter': {'heatsink_temp_C': 80},
+                'breakers': [{
+                    'device_id': self.breaker.device_id,
+                    'switch': False,
+                }],
+            },
+            'actions': [],
+        }
+
+        self._upload(confirmation, **self._device_headers())
+
+        action = BreakerAction.objects.get(action_id=self.action_id)
+        self.assertEqual(action.status, 'applied')
+        self.assertFalse(action.resulting_state)
+        safety = Tier1SafetyState.objects.get(organization=self.organization)
+        self.assertTrue(safety.active)
+        self.assertEqual(
+            [command['device_id'] for command in safety.commands],
+            [self.breaker.device_id],
+        )
 
     def test_partial_batch_rejection_does_not_discard_valid_event(self):
         response = self.client.post(
@@ -151,6 +248,22 @@ class DecisionAuditApiTests(APITestCase):
         self.assertEqual(action.status, 'applied')
         self.assertTrue(action.executed)
         self.assertFalse(action.resulting_state)
+        rejected_change = self.client.post(
+            '/api/kbs/edge/action-results/',
+            {'results': [{
+                'action_id': str(self.action_id),
+                'status': 'failed',
+                'failure_reason': 'late contradictory result',
+            }]},
+            format='json',
+            **self._device_headers(),
+        )
+        self.assertEqual(
+            rejected_change.json()['results'][0]['status'],
+            'rejected',
+        )
+        action.refresh_from_db()
+        self.assertEqual(action.status, 'applied')
 
     def test_device_snapshot_and_audit_survive_hardware_deletion(self):
         self._upload(**self._device_headers())
@@ -192,4 +305,3 @@ class DecisionAuditApiTests(APITestCase):
         self.assertEqual(technician_response.json()['count'], 2)
         self.assertTrue(legacy_detail.json()['legacy'])
         self.assertEqual(legacy_detail.json()['trace'], [])
-

@@ -6,6 +6,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.breakers.models import Breaker, BreakerReading
+from apps.organizations.models import Organization
 from apps.telemetry.models import Reading
 
 from ..contracts import TIER2_ENGINE
@@ -14,7 +15,14 @@ from ..engine.derived import (
     joule_deficit_J, mean, ramped_threshold,
 )
 from ..engine.facts import BreakerFacts, SystemFacts, facts_to_dict
-from ..models import Alert, BreakerAction, KBSDecision, KBSSettings
+from ..engine.rules import decide as decide_tier2
+from ..interlock import (
+    Tier1SafetyCommand, Tier1SafetySnapshot, is_interlock_result,
+    mirror_tier1_decision,
+)
+from ..models import (
+    Alert, BreakerAction, KBSDecision, KBSSettings, Tier1SafetyState,
+)
 from ..weather import get_weather_context
 
 
@@ -184,8 +192,25 @@ class DjangoKBSAdapter:
             pv_day_min_W=settings.pv_day_min_W,
         )
 
+    def make_decision(self, organization, facts, default_decider):
+        """Bypass normal Tier-2 rules while Tier-1 owns an active danger."""
+        safety = self._safety_snapshot(organization)
+        if safety.active:
+            return mirror_tier1_decision(facts, safety)
+        return default_decider(facts)
+
     @transaction.atomic
     def persist_result(self, organization, facts, result):
+        # The organization row serializes Tier-1 ingestion with Tier-2
+        # persistence. Re-reading the safety state here closes the race where a
+        # danger starts or clears while Tier-2 is building facts.
+        Organization.objects.select_for_update().only('id').get(pk=organization.pk)
+        safety = self._safety_snapshot(organization, for_update=True)
+        if safety.active:
+            result = mirror_tier1_decision(facts, safety)
+        elif is_interlock_result(result):
+            result = decide_tier2(facts)
+
         trace = list(result.trace)
         decision = KBSDecision.objects.create(
             organization=organization,
@@ -249,6 +274,43 @@ class DjangoKBSAdapter:
             decision.trace = trace
             decision.save(update_fields=['trace'])
         return decision
+
+    @staticmethod
+    def _safety_snapshot(organization, for_update=False):
+        queryset = Tier1SafetyState.objects
+        if for_update:
+            queryset = queryset.select_for_update()
+            state = queryset.filter(organization=organization).first()
+        else:
+            state = queryset.filter(organization=organization).select_related(
+                'source_decision',
+            ).first()
+        if state is None or not state.active:
+            return Tier1SafetySnapshot(active=False)
+        commands = []
+        for raw in state.commands:
+            if not isinstance(raw, dict):
+                continue
+            device_id = str(raw.get('device_id') or '')
+            action = raw.get('action')
+            if not device_id or action not in ('on', 'off'):
+                continue
+            commands.append(Tier1SafetyCommand(
+                device_id=device_id,
+                action=action,
+                countdown_s=max(int(raw.get('countdown_s') or 0), 0),
+                reason=str(raw.get('reason') or ''),
+            ))
+        return Tier1SafetySnapshot(
+            active=True,
+            situation=state.situation,
+            episode_id=str(state.episode_id or ''),
+            source_event_id=(
+                str(state.source_decision.event_id)
+                if state.source_decision_id else ''
+            ),
+            commands=tuple(commands),
+        )
 
     @staticmethod
     def _pv_power_W(reading):

@@ -264,8 +264,7 @@ def evaluate(inverter, breakers, cfg=None):
         )
         if not sheds:
             _step(trace, 'tier1.battery_low.noop', 'noop', 'noop',
-                  'Battery is low but no eligible loads can be shed.')
-            return Tier1Result(situation='', trace=trace)
+                  'Battery is still low but no additional eligible load can be shed.')
         for breaker in sheds:
             _step(
                 trace, 'tier1.battery_low.breaker.include', 'breaker_selection', 'included',
@@ -284,9 +283,18 @@ def evaluate(inverter, breakers, cfg=None):
                 for breaker in sheds
             ],
             notify=(
-                f'Tier-1: battery at {v_bat:.2f} V is close to its floor. '
-                f'{len(sheds)} breaker(s) will switch off in ~{countdown_s // 60} min: '
-                f'{", ".join(breaker.device_id for breaker in sheds)}.'
+                (
+                    f'Tier-1: battery at {v_bat:.2f} V is close to its floor. '
+                    f'{len(sheds)} breaker(s) will switch off in '
+                    f'~{countdown_s // 60} min: '
+                    f'{", ".join(breaker.device_id for breaker in sheds)}.'
+                )
+                if sheds else
+                (
+                    f'Tier-1: battery at {v_bat:.2f} V remains close to its '
+                    'floor; the safety hold stays active and no additional '
+                    'eligible loads remain to shed.'
+                )
             ),
             trace=trace,
         )
@@ -328,6 +336,18 @@ def evaluate(inverter, breakers, cfg=None):
                 )
             _step(trace, 'tier1.grid_outage.noop', 'noop', 'noop',
                   'Grid is unavailable but no additional eligible load can be shed.')
+            _step(trace, 'tier1.branch.grid_outage', 'branch', 'selected',
+                  'Kept the grid-outage safety hold active with no new command.')
+            return Tier1Result(
+                situation='grid_outage',
+                commands=[],
+                notify=(
+                    'Tier-1: the grid remains unavailable and the battery is '
+                    'low. The safety hold stays active; no additional eligible '
+                    'loads remain to shed.'
+                ),
+                trace=trace,
+            )
 
     _step(trace, 'tier1.branch.no_critical_situation', 'branch', 'selected',
           'No Tier-1 situation requires action; Tier-2 remains in charge.')

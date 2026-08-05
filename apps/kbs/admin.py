@@ -2,6 +2,7 @@ from django.contrib import admin
 
 from .models import (
     Alert, BreakerAction, EdgeDevice, KBSDecision, KBSSettings, ScheduledEvent,
+    Tier1SafetyState,
 )
 
 
@@ -66,6 +67,27 @@ class EdgeDeviceAdmin(admin.ModelAdmin):
     list_filter = ('status', 'organization')
     search_fields = ('device_id', 'name', 'organization__name')
     readonly_fields = ('device_id', 'secret_hash', 'last_seen_at', 'created_at', 'updated_at')
+
+
+@admin.register(Tier1SafetyState)
+class Tier1SafetyStateAdmin(admin.ModelAdmin):
+    list_display = (
+        'organization', 'active', 'situation', 'episode_id',
+        'source_occurred_at', 'updated_at',
+    )
+    list_filter = ('active', 'situation', 'organization')
+    search_fields = ('organization__name', 'episode_id', 'situation')
+    readonly_fields = (
+        'organization', 'edge_device', 'source_decision', 'active', 'situation',
+        'episode_id', 'commands', 'source_occurred_at', 'activated_at',
+        'cleared_at', 'updated_at',
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(Alert)

@@ -14,7 +14,9 @@ from apps.telemetry.models import Reading
 
 from .climate import CLIMATE_CSV_PATH, ClimateDataError, load_climate_rows
 from .contracts import TIER2_ENGINE
-from .models import Alert, BreakerAction, KBSDecision, KBSSettings
+from .models import (
+    Alert, BreakerAction, KBSDecision, KBSSettings, Tier1SafetyState,
+)
 from .services import run_cycle
 
 SETTINGS_EDITABLE_FIELDS = (
@@ -87,6 +89,35 @@ def _breaker_dict(breaker):
         'lockout_reason': breaker.lockout_reason,
         'locked_at': breaker.locked_at,
         'reported_at': current.reported_at if current else None,
+    }
+
+
+def _tier1_safety_dict(safety):
+    if safety is None:
+        return {
+            'active': False,
+            'situation': '',
+            'episode_id': None,
+            'source_event_id': None,
+            'commands': [],
+            'source_occurred_at': None,
+            'activated_at': None,
+            'cleared_at': None,
+            'updated_at': None,
+        }
+    return {
+        'active': safety.active,
+        'situation': safety.situation,
+        'episode_id': str(safety.episode_id) if safety.episode_id else None,
+        'source_event_id': (
+            str(safety.source_decision.event_id)
+            if safety.source_decision_id else None
+        ),
+        'commands': safety.commands,
+        'source_occurred_at': safety.source_occurred_at,
+        'activated_at': safety.activated_at,
+        'cleared_at': safety.cleared_at,
+        'updated_at': safety.updated_at,
     }
 
 
@@ -172,6 +203,9 @@ class SimStateView(APIView):
             newest_per_breaker[action.device_id] = action
         pending = sorted(newest_per_breaker.values(), key=lambda action: action.created_at)
         alerts = Alert.objects.filter(organization=org, suppressed=False)[:10]
+        safety = Tier1SafetyState.objects.filter(
+            organization=org,
+        ).select_related('source_decision').first()
         latest_reading = Reading.objects.filter(organization=org).first()
         breakers = Breaker.objects.filter(organization=org).select_related('status')
         return Response({
@@ -184,6 +218,7 @@ class SimStateView(APIView):
             },
             'settings': {field: getattr(kbs, field) for field in SETTINGS_SHARED_FIELDS},
             'latest_telemetry': _reading_dict(latest_reading),
+            'tier1_safety': _tier1_safety_dict(safety),
             'breakers': [_breaker_dict(breaker) for breaker in breakers],
             'metadata': {
                 'engine': TIER2_ENGINE,
@@ -219,7 +254,11 @@ class AckActionsView(APIView):
     def post(self, request):
         ids = request.data.get('action_ids', [])
         updated = 0
+        ignored = 0
         for action in BreakerAction.objects.filter(id__in=ids):
+            if action.status in BreakerAction.RESOLVED_STATUSES:
+                ignored += 1
+                continue
             action.status = 'applied'
             action.resulting_state = action.action == 'on'
             action.executed_at = timezone.now()
@@ -232,13 +271,16 @@ class AckActionsView(APIView):
                 action = BreakerAction.objects.filter(action_id=payload.get('action_id')).first()
             if action is None:
                 continue
+            if action.status in BreakerAction.RESOLVED_STATUSES:
+                ignored += 1
+                continue
             action.status = payload.get('status', action.status)
             action.resulting_state = payload.get('resulting_state', action.resulting_state)
             action.failure_reason = str(payload.get('failure_reason') or '')[:500]
             action.executed_at = timezone.now()
             action.save()
             updated += 1
-        return Response({'acknowledged': updated})
+        return Response({'acknowledged': updated, 'ignored_resolved': ignored})
 
 
 class SettingsView(APIView):
@@ -295,6 +337,7 @@ class SimResetView(SimulatorOnlyMixin, APIView):
         BreakerReading.objects.filter(breaker__organization=org).delete()
         KBSDecision.objects.filter(organization=org).delete()
         Alert.objects.filter(organization=org).delete()
+        Tier1SafetyState.objects.filter(organization=org).delete()
         Breaker.objects.filter(organization=org).update(
             child_lock=False, locked_out=False, lockout_reason='', locked_at=None,
         )

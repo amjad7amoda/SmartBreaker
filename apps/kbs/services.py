@@ -36,13 +36,16 @@ def run_cycle(organization, now=None, adapter=None):
         logger.warning('KBS skipped, no facts: org=%s', organization.id)
         return None
 
-    result = decide(facts)
+    make_decision = getattr(adapter, 'make_decision', None)
+    result = (
+        make_decision(organization, facts, decide)
+        if make_decision is not None
+        else decide(facts)
+    )
     decision = adapter.persist_result(organization, facts, result)
     logger.info(
-        'KBS decision: org=%s branch=%s actions=%d alerts=%d',
+        'KBS decision persisted: org=%s branch=%s',
         organization.id,
-        result.branch,
-        len(result.actions),
-        len(result.alerts),
+        decision.branch,
     )
     return decision

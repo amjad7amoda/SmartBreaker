@@ -21,7 +21,7 @@ except ImportError:
 
 ACTION_STATUSES = {
     'pending', 'scheduled', 'applied', 'blocked', 'failed', 'noop',
-    'suppressed_duplicate',
+    'suppressed_duplicate', 'superseded',
 }
 
 

@@ -154,8 +154,12 @@ class BreakerAction(models.Model):
         ('failed', 'Failed'),
         ('noop', 'No-op'),
         ('suppressed_duplicate', 'Suppressed duplicate'),
+        ('superseded', 'Superseded'),
     ]
-    RESOLVED_STATUSES = {'applied', 'blocked', 'failed', 'noop', 'suppressed_duplicate'}
+    RESOLVED_STATUSES = {
+        'applied', 'blocked', 'failed', 'noop', 'suppressed_duplicate',
+        'superseded',
+    }
 
     action_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     decision = models.ForeignKey(
@@ -199,6 +203,38 @@ class BreakerAction(models.Model):
 
     def __str__(self):
         return f'{self.device_id} -> {self.action} ({self.status})'
+
+
+class Tier1SafetyState(models.Model):
+    """Latest authoritative Tier-1 safety state for one organization.
+
+    This is coordination state, not another rules engine: Tier-1 evaluates the
+    hazard and this row lets Tier-2 observe the resulting safety hold.
+    """
+
+    organization = models.OneToOneField(
+        Organization, on_delete=models.CASCADE, related_name='tier1_safety_state'
+    )
+    edge_device = models.ForeignKey(
+        EdgeDevice, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='safety_states',
+    )
+    source_decision = models.ForeignKey(
+        KBSDecision, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='safety_state_updates',
+    )
+    active = models.BooleanField(default=False)
+    situation = models.CharField(max_length=100, blank=True)
+    episode_id = models.UUIDField(null=True, blank=True, editable=False)
+    commands = models.JSONField(default=list)
+    source_occurred_at = models.DateTimeField(null=True, blank=True)
+    activated_at = models.DateTimeField(null=True, blank=True)
+    cleared_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        state = self.situation if self.active else 'clear'
+        return f'{self.organization_id} Tier-1 safety: {state}'
 
 
 class Alert(models.Model):

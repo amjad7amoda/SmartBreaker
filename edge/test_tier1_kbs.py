@@ -94,6 +94,23 @@ class BatteryTests(unittest.TestCase):
         self.assertEqual(result.situation, 'battery_critical')
         self.assertTrue(all(c.countdown_s == 0 for c in result.commands))
 
+    def test_low_battery_hold_remains_active_after_all_loads_are_off(self):
+        breakers = site()
+        for breaker in breakers:
+            if breaker.priority_type in ('comfort', 'normal'):
+                breaker.switch = False
+        result = evaluate(
+            InverterState(
+                battery_voltage_V=24.4,
+                battery_discharge_current_A=10.0,
+            ),
+            breakers,
+        )
+
+        self.assertEqual(result.situation, 'battery_low')
+        self.assertEqual(result.commands, [])
+        self.assertIn('hold stays active', result.notify)
+
     def test_countdown_clamps(self):
         cfg = Tier1Config()
         self.assertEqual(graceful_countdown_s(100.0, 1200.0, cfg), 300)
@@ -129,6 +146,25 @@ class GridOutageTests(unittest.TestCase):
             battery_voltage_V=24.9, battery_discharge_current_A=48.0,
         )
         self.assertEqual(evaluate(inv, site(grid_on=True)).situation, '')
+
+    def test_outage_hold_remains_active_after_all_sheddable_loads_are_off(self):
+        breakers = site(grid_on=True)
+        for breaker in breakers:
+            if breaker.priority_type in ('comfort', 'normal'):
+                breaker.switch = False
+        result = evaluate(
+            InverterState(
+                ac_output_active_power_W=300,
+                grid_voltage_V=0.0,
+                battery_voltage_V=24.9,
+                battery_discharge_current_A=12.0,
+            ),
+            breakers,
+        )
+
+        self.assertEqual(result.situation, 'grid_outage')
+        self.assertEqual(result.commands, [])
+        self.assertIn('hold stays active', result.notify)
 
 
 class PriorityTests(unittest.TestCase):

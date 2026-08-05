@@ -67,6 +67,21 @@ class AuditedTier1ServiceTests(unittest.TestCase):
             [first.event_id],
         )
 
+    def test_danger_does_not_clear_only_because_no_more_commands_are_needed(self):
+        low = InverterState(
+            battery_voltage_V=24.4,
+            battery_discharge_current_A=10.0,
+        )
+
+        first = self.service.evaluate(low, danger_site())
+        still_dangerous = self.service.evaluate(low, danger_site(switch=False))
+        cleared = self.service.evaluate(InverterState(), danger_site(switch=False))
+
+        self.assertEqual(first.situation, 'battery_low')
+        self.assertEqual(still_dangerous.situation, 'battery_low')
+        self.assertNotEqual(still_dangerous.event_type, 'clear')
+        self.assertEqual(cleared.event_type, 'clear')
+
     def test_evaluator_errors_are_durable_events(self):
         def broken_evaluator(*args, **kwargs):
             raise RuntimeError('sensor decode failed')

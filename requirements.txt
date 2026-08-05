@@ -6,6 +6,7 @@ psycopg2-binary
 cryptography
 requests
 celery
+django-celery-beat
 redis
 channels
 channels-redis

@@ -1,49 +1,42 @@
 import json
 import time
+from datetime import timedelta
 
 from django.core.cache import cache
+from django.utils import timezone
 
-from .models import TuyaCredential
+from apps.telemetry.models import Reading
+from apps.telemetry.serializers import ReadingSerializer
+
+from apps.notifications.services import notify
+from . import scheduling
+from .models import BreakerAction, TuyaCredential
 from .tuya import TuyaClient, TuyaError
 
-# Device specifications describe the hardware, not its state, so they are
-# effectively immutable and worth caching aggressively.
 SPEC_CACHE_TTL = 60 * 60 * 24
 
-# Reading and writing the relay use different codes on this device family: the
-# shadow reports `switch_1` while the instruction set accepts `switch`. Verify
-# against `tuya_check`, which prints the writable codes, before changing these.
 SWITCH_READ_CODE = 'switch_1'
 SWITCH_WRITE_CODE = 'switch'
 
-# A full lockout, not just a button guard: the device opens the relay and
-# ignores every command, at the panel and over the API, until it is released.
-# Enabling it therefore de-energises the load.
 CHILD_LOCK_CODE = 'child_lock'
 
-# Tuya's device shadow lags the physical relay by a moment, so an immediate
-# read-back often still shows the old state. One short retry converts most of
-# those into a confirmed result without making the request feel stuck.
+COUNTDOWN_CODE = 'countdown_1'
+MAX_COUNTDOWN_MINUTES = 1440  # Tuya caps countdown_1 at 86400 seconds.
+
 CONFIRM_RETRY_DELAY = 0.6
 
-# Tuya reports integers plus a scale: the real value is raw / 10**scale. The
-# unit is reported separately and is not always the one we want to expose
-# (current is commonly milliamps), so it is converted explicitly below.
 CURRENT_UNIT_DIVISORS = {'ma': 1000.0, 'a': 1.0}
 
 
-def _specifications(client, device_id):
+def specifications(client, device_id):
     """Return {code: (scale, unit)}. Empty when Tuya cannot tell us."""
     cache_key = f'tuya:spec:{device_id}'
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
-
     try:
         spec = client.get_device_specification(device_id)
     except TuyaError:
-        # A missing spec must not fail the whole read; the caller is told that
-        # units are unresolved instead of being handed mis-scaled numbers.
         return {}
 
     scales = {}
@@ -60,8 +53,7 @@ def _specifications(client, device_id):
     cache.set(cache_key, scales, SPEC_CACHE_TTL)
     return scales
 
-
-def _scaled(properties, specs, code):
+def scaled(properties, specs, code):
     if code not in properties or properties[code] is None:
         return None, ''
     scale, unit = specs.get(code, (None, ''))
@@ -69,8 +61,7 @@ def _scaled(properties, specs, code):
         return properties[code], unit
     return properties[code] / (10 ** scale), unit
 
-
-def _client_for(breaker):
+def client_for(breaker):
     credential = TuyaCredential.objects.filter(organization=breaker.organization).first()
     if credential is None:
         raise LookupError(
@@ -78,9 +69,30 @@ def _client_for(breaker):
         )
     return TuyaClient(credential)
 
+def latest_telemetry(organization_id):
+    reading = (
+        Reading.objects.filter(organization_id=organization_id)
+        .order_by('-timestamp')
+        .first()
+    )
+    return ReadingSerializer(reading).data if reading else None
 
-def _write_and_confirm(breaker, write_code, value, status_key):
-    client = _client_for(breaker)
+def record_action(breaker, action, result, source, actor=None, reason=''):
+    """Preserve what the system saw at the moment it acted, so the decision can be
+    reconstructed later even after the telemetry it was based on has aged out."""
+    return BreakerAction.objects.create(
+        breaker=breaker,
+        action=action,
+        source=source,
+        reason=reason,
+        actor=actor,
+        confirmed=result.get('confirmed'),
+        telemetry=latest_telemetry(breaker.organization_id),
+        breaker_status=result.get('status'),
+    )
+
+def write_and_confirm(breaker, write_code, value, status_key):
+    client = client_for(breaker)
     client.send_commands(breaker.device_id, [{'code': write_code, 'value': value}])
 
     status = read_status(breaker)
@@ -89,10 +101,9 @@ def _write_and_confirm(breaker, write_code, value, status_key):
         status = read_status(breaker)
     return status
 
-
-def set_switch(breaker, turn_on):
+def set_switch(breaker, turn_on, source='manual', actor=None, reason=''):
     turn_on = bool(turn_on)
-    status = _write_and_confirm(breaker, SWITCH_WRITE_CODE, turn_on, 'is_on')
+    status = write_and_confirm(breaker, SWITCH_WRITE_CODE, turn_on, 'is_on')
 
     result = {
         'device_id': breaker.device_id,
@@ -100,28 +111,44 @@ def set_switch(breaker, turn_on):
         'confirmed': status['is_on'] is turn_on,
         'status': status,
     }
-    # The lock silently swallows switch commands, which otherwise looks like an
-    # unexplained failure. The state was just read, so this costs nothing.
+
     if not result['confirmed'] and status['child_lock']:
         result['reason'] = 'The breaker is child-locked; disable the lock before switching it.'
+
+    record_action(
+        breaker, 'switch_on' if turn_on else 'switch_off', result, source, actor, reason
+    )
     return result
 
+def set_child_lock(breaker, enabled, source='manual', actor=None, reason=''):
 
-def set_child_lock(breaker, enabled):
-    """Engage or release the device lockout.
-
-    On this hardware the lock is not merely a button guard: it opens the relay
-    and refuses every command, local or remote, until it is released. Enabling
-    it therefore cuts power to the load, which the response states plainly
-    rather than leaving the caller to discover it.
-    """
     enabled = bool(enabled)
-    status = _write_and_confirm(breaker, CHILD_LOCK_CODE, enabled, 'child_lock')
+
+    current = read_status(breaker)
+    if current['child_lock'] is enabled:
+        return {
+            'device_id': breaker.device_id,
+            'requested': enabled,
+            'confirmed': True,
+            'changed': False,
+            'reason': (
+                'The breaker is already child-locked.' if enabled
+                else 'The breaker is already unlocked.'
+            ),
+            'status': current,
+        }
+
+    status = write_and_confirm(breaker, CHILD_LOCK_CODE, enabled, 'child_lock')
+
+    if breaker.child_lock != status['child_lock']:
+        breaker.child_lock = status['child_lock']
+        breaker.save(update_fields=['child_lock'])
 
     result = {
         'device_id': breaker.device_id,
         'requested': enabled,
         'confirmed': status['child_lock'] is enabled,
+        'changed': True,
         'status': status,
     }
     if enabled and result['confirmed']:
@@ -129,24 +156,69 @@ def set_child_lock(breaker, enabled):
             'The breaker is locked open and cannot be switched, by this API or '
             'at the panel, until the child lock is disabled.'
         )
+
+    record_action(
+        breaker, 'child_lock_on' if enabled else 'child_lock_off', result, source, actor, reason
+    )
+
+    notify(
+        breaker.organization.owner_id,
+        f'Breaker {breaker.label} has been locked.' if enabled
+        else f'Breaker {breaker.label} has been unlocked.',
+    )
     return result
 
+def countdown_confirmed(status, seconds):
+    remaining = status['countdown_s'] or 0
+    return remaining == 0 if seconds == 0 else remaining > 0
+
+def set_countdown(breaker, minutes, source='manual', actor=None, reason=''):
+    seconds = int(minutes) * 60
+    client = client_for(breaker)
+    client.send_commands(breaker.device_id, [{'code': COUNTDOWN_CODE, 'value': seconds}])
+
+    status = read_status(breaker)
+    if not countdown_confirmed(status, seconds):
+        time.sleep(CONFIRM_RETRY_DELAY)
+        status = read_status(breaker)
+
+    remaining = status['countdown_s'] or 0
+    result = {
+        'device_id': breaker.device_id,
+        'requested_minutes': minutes,
+        'confirmed': countdown_confirmed(status, seconds),
+        'remaining_s': remaining,
+        # Tuya's countdown toggles the relay rather than opening it. This status was
+        # read after the write but before expiry, so is_on is still the state the
+        # countdown will act against.
+        'action': ('off' if status['is_on'] else 'on') if remaining else None,
+        'switches_at': (
+            (timezone.now() + timedelta(seconds=remaining)).isoformat() if remaining else None
+        ),
+        'status': status,
+    }
+    if remaining and status['child_lock']:
+        result['warning'] = (
+            'The breaker is child-locked, so the countdown will not be able to move '
+            'the relay until the lock is released.'
+        )
+
+    record_action(breaker, 'countdown_set' if seconds else 'countdown_cancel', result, source, actor, reason)
+    return result
 
 def read_status(breaker, include_raw=False):
-    client = _client_for(breaker)
+    client = client_for(breaker)
     result = client.get_device_properties(breaker.device_id)
     raw_properties = result.get('properties', [])
     properties = {p['code']: p['value'] for p in raw_properties}
-    specs = _specifications(client, breaker.device_id)
+    specs = specifications(client, breaker.device_id)
 
-    voltage, _ = _scaled(properties, specs, 'cur_voltage')
-    power, _ = _scaled(properties, specs, 'cur_power')
-    current, current_unit = _scaled(properties, specs, 'cur_current')
+    voltage, _ = scaled(properties, specs, 'cur_voltage')
+    power, _ = scaled(properties, specs, 'cur_power')
+    current, current_unit = scaled(properties, specs, 'cur_current')
     if current is not None:
         current /= CURRENT_UNIT_DIVISORS.get(current_unit.lower(), 1.0)
 
-    # The device is authoritative for the lock; our column is a mirror, so a
-    # read is also the reconciliation point after a change made in the Tuya app.
     child_lock = properties.get(CHILD_LOCK_CODE)
     if child_lock is not None and breaker.child_lock != child_lock:
         breaker.child_lock = child_lock
@@ -154,10 +226,12 @@ def read_status(breaker, include_raw=False):
 
     status = {
         'device_id': breaker.device_id,
+        'name': breaker.name,
         'organization': breaker.organization_id,
         'online': properties.get('online_state') == 'online',
         'is_on': properties.get(SWITCH_READ_CODE),
         'child_lock': child_lock,
+        'countdown_s': properties.get(COUNTDOWN_CODE),
         'fault': properties.get('fault'),
         'voltage_V': voltage,
         'current_A': current,
@@ -165,5 +239,12 @@ def read_status(breaker, include_raw=False):
         'units_resolved': bool(specs),
     }
     if include_raw:
+        # Raw is a debugging aid and far bulkier than the rest; keep it out of the
+        # cache so a ?raw=1 call cannot poison what everyone else reads.
         status['raw'] = raw_properties
+    else:
+        # Caching here rather than in the poller means every fresh read refreshes the
+        # cache — including the read that follows a switch or a lock, which is what
+        # keeps a command from leaving a stale status behind it.
+        scheduling.cache_status(breaker.device_id, status)
     return status

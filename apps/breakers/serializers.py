@@ -2,7 +2,8 @@ from django.core.cache import cache
 from rest_framework import serializers
 
 from . import exceptions
-from .models import Breaker, TuyaCredential
+from .models import Breaker, BreakerAction, TuyaCredential
+from .services import MAX_COUNTDOWN_MINUTES
 from .tuya import TuyaClient, TuyaError
 
 
@@ -63,54 +64,67 @@ class TuyaCredentialSerializer(serializers.ModelSerializer):
 
 class BreakerSerializer(serializers.ModelSerializer):
     organization_name = serializers.CharField(source='organization.name', read_only=True)
-
     class Meta:
         model = Breaker
         fields = (
-            'id', 'device_id', 'organization', 'organization_name', 'type', 'priority',
+            'id', 'name', 'device_id', 'organization', 'organization_name', 'type', 'priority',
             'protected', 'child_lock', 'peak_load', 'mean_load', 'cycle_start',
             'cycle_end', 'created_at',
         )
         read_only_fields = fields
 
-
 class BreakerSwitchSerializer(serializers.Serializer):
     state = serializers.ChoiceField(choices=('on', 'off'))
+    reason = serializers.CharField(required=False, allow_blank=True, default='')
 
     @property
     def turn_on(self):
         return self.validated_data['state'] == 'on'
 
-
 class BreakerChildLockSerializer(serializers.Serializer):
     enabled = serializers.BooleanField()
+    reason = serializers.CharField(required=False, allow_blank=True, default='')
 
+
+class BreakerCountdownSerializer(serializers.Serializer):
+
+    minutes = serializers.IntegerField(min_value=0, max_value=MAX_COUNTDOWN_MINUTES)
+    reason = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+class BreakerActionSerializer(serializers.ModelSerializer):
+    device_id = serializers.CharField(source='breaker.device_id', read_only=True)
+    breaker_name = serializers.CharField(source='breaker.name', read_only=True)
+    organization = serializers.IntegerField(source='breaker.organization_id', read_only=True)
+    actor_email = serializers.EmailField(source='actor.email', read_only=True, default=None)
+
+    class Meta:
+        model = BreakerAction
+        fields = (
+            'id', 'breaker', 'breaker_name', 'device_id', 'organization', 'action', 'source',
+            'reason', 'actor', 'actor_email', 'confirmed', 'telemetry',
+            'breaker_status', 'created_at',
+        )
+        read_only_fields = fields
 
 class BreakerUpdateSerializer(serializers.ModelSerializer):
-    """device_id and organization are fixed at creation: changing either would
-    describe a different physical device, so it is a create, not an edit.
-    Keeping them out also means an edit never has to call Tuya."""
-
     class Meta:
         model = Breaker
         fields = (
-            'id', 'device_id', 'organization', 'type', 'priority', 'protected',
+            'id', 'name', 'device_id', 'organization', 'type', 'priority', 'protected',
             'child_lock', 'peak_load', 'mean_load', 'cycle_start', 'cycle_end', 'created_at',
         )
         read_only_fields = (
             'id', 'device_id', 'organization', 'created_at',
-            # Owned by the device; use the child-lock endpoint to change it.
             'child_lock',
         )
 
-
 class BreakerCreateSerializer(serializers.ModelSerializer):
     tuya = serializers.SerializerMethodField(read_only=True)
-
     class Meta:
         model = Breaker
         fields = (
-            'id', 'device_id', 'organization', 'type', 'priority', 'protected',
+            'id', 'name', 'device_id', 'organization', 'type', 'priority', 'protected',
             'child_lock', 'peak_load', 'mean_load', 'cycle_start', 'cycle_end',
             'created_at', 'tuya',
         )
@@ -137,14 +151,15 @@ class BreakerCreateSerializer(serializers.ModelSerializer):
 
         properties = {p['code']: p['value'] for p in result.get('properties', [])}
         online = properties.get('online_state') == 'online'
+
         self._verification = {
             'verified': True,
             'online': online,
             'switch_on': properties.get('switch_1'),
             'fault': properties.get('fault'),
         }
-        # An unpowered breaker is still a legitimate registration, so being
-        # offline is reported rather than rejected.
+
         if not online:
             self._verification['warning'] = 'Device is registered on Tuya but currently offline.'
+
         return attrs

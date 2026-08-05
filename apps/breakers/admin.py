@@ -41,9 +41,9 @@ class TuyaCredentialAdmin(admin.ModelAdmin):
 @admin.register(Breaker)
 class BreakerAdmin(admin.ModelAdmin):
     list_display = (
-        'device_id', 'organization', 'type', 'priority', 'protected', 'child_lock',
+        'name', 'device_id', 'organization', 'type', 'priority', 'protected', 'child_lock',
         'peak_load', 'mean_load', 'cycle_start', 'cycle_end',
     )
     list_filter = ('type', 'protected', 'child_lock', 'organization')
-    search_fields = ('device_id', 'organization__name')
+    search_fields = ('name', 'device_id', 'organization__name')
     readonly_fields = ('created_at',)

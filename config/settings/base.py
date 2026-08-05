@@ -19,7 +19,9 @@ SECRET_KEY = 'django-insecure-2(m0qmell5qtw4vm2vsuw=!7__99*ns^@_*hna@qah38ubcwiw
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+# The Pi posts readings to the server's LAN address, not to localhost, so an
+# empty list would 400 every ingest request while DEBUG is on.
+ALLOWED_HOSTS = [h for h in os.getenv('ALLOWED_HOSTS', '*' if DEBUG else '').split(',') if h]
 
 
 # Application definition
@@ -35,12 +37,14 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
     'corsheaders',
+    'django_celery_beat',
 
     # Local apps
     'apps.accounts',
     'apps.organizations',
     'apps.breakers',
     'apps.telemetry',
+    'apps.notifications',
 ]
 
 MIDDLEWARE = [
@@ -52,6 +56,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'apps.breakers.middleware.OrganizationPollingMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -159,3 +164,21 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TASK_ALWAYS_EAGER = os.getenv('CELERY_TASK_ALWAYS_EAGER', 'False') == 'True'
+
+# Per-organization pollers are created while the server is running, so beat has to
+# read its schedule from the database rather than from a static dict in here.
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+
+# The Tuya token, the device specification cache and the polled breaker statuses all
+# have to be visible to every web worker *and* to the Celery worker. LocMemCache is
+# per-process, so without a shared backend the poller warms a cache nobody else reads.
+CACHE_URL = os.getenv('CACHE_URL') or os.getenv('REDIS_URL')
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': CACHE_URL,
+    } if CACHE_URL else {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'smartbreaker',
+    }
+}

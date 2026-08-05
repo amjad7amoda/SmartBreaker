@@ -1,12 +1,17 @@
+import json
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django_celery_beat.models import PeriodicTask
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.organizations.models import Organization
 
-from .models import Breaker, TuyaCredential
+from . import scheduling
+from .models import Breaker, BreakerAction, TuyaCredential
+from .tasks import refresh_organization_breakers
 
 User = get_user_model()
 
@@ -266,10 +271,11 @@ class StatusTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
-def props(switch_on, child_lock=False):
+def props(switch_on, child_lock=False, countdown=0):
     return {'properties': [
         {'code': 'switch_1', 'value': switch_on},
         {'code': 'child_lock', 'value': child_lock},
+        {'code': 'countdown_1', 'value': countdown},
         {'code': 'online_state', 'value': 'online'},
     ]}
 
@@ -352,6 +358,106 @@ class SwitchTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+class ActionLogTests(APITestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.owner = make_user('aowner@example.com', 'home_user')
+        cls.stranger = make_user('astranger@example.com', 'home_user')
+        cls.organization = Organization.objects.create(
+            name='Site J', phone='10', latitude=0, longitude=0, owner=cls.owner, status='active'
+        )
+        credential = TuyaCredential(organization=cls.organization, client_id='cid10', region='us')
+        credential.client_secret = 'secret'
+        credential.save()
+        Breaker.objects.create(device_id=DEVICE_ID, organization=cls.organization, priority=1)
+
+    def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties', return_value=props(True))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_switching_records_an_action_with_the_actor_and_reason(self, _send, _p, _s):
+        self.client.force_authenticate(self.owner)
+        self.client.post(
+            f'/api/breakers/{DEVICE_ID}/switch/',
+            {'state': 'on', 'reason': 'manual test'}, format='json',
+        )
+
+        action = BreakerAction.objects.get()
+        self.assertEqual(action.action, 'switch_on')
+        self.assertEqual(action.source, 'manual')
+        self.assertEqual(action.reason, 'manual test')
+        self.assertEqual(action.actor, self.owner)
+        self.assertTrue(action.confirmed)
+        # The Tuya status is snapshotted because it is persisted nowhere else.
+        self.assertTrue(action.breaker_status['is_on'])
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties', return_value=props(True))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_the_latest_reading_is_copied_into_the_action(self, _send, _p, _s):
+        from django.utils import timezone
+        from apps.telemetry.models import Reading
+
+        Reading.objects.create(
+            organization=self.organization, timestamp=timezone.now(), output_load_percent=73.0
+        )
+
+        self.client.force_authenticate(self.owner)
+        self.client.post(f'/api/breakers/{DEVICE_ID}/switch/', {'state': 'on'}, format='json')
+
+        action = BreakerAction.objects.get()
+        self.assertEqual(action.telemetry['output_load_percent'], 73.0)
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties', return_value=props(True))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_an_action_is_still_recorded_when_no_telemetry_has_arrived(self, _send, _p, _s):
+        self.client.force_authenticate(self.owner)
+        self.client.post(f'/api/breakers/{DEVICE_ID}/switch/', {'state': 'on'}, format='json')
+
+        self.assertIsNone(BreakerAction.objects.get().telemetry)
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties',
+           return_value=props(True, countdown=1800))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_actions_are_listed_and_filterable(self, _send, _p, _s):
+        self.client.force_authenticate(self.owner)
+        self.client.post(f'/api/breakers/{DEVICE_ID}/switch/', {'state': 'on'}, format='json')
+        self.client.post(f'/api/breakers/{DEVICE_ID}/countdown/', {'minutes': 30}, format='json')
+
+        listed = self.client.get('/api/breakers/actions/').json()
+        self.assertEqual(len(listed), 2)
+        self.assertEqual(listed[0]['device_id'], DEVICE_ID)
+
+        filtered = self.client.get('/api/breakers/actions/?action=countdown_set').json()
+        self.assertEqual([a['action'] for a in filtered], ['countdown_set'])
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties', return_value=props(True))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_a_stranger_cannot_see_another_organizations_actions(self, _send, _p, _s):
+        self.client.force_authenticate(self.owner)
+        self.client.post(f'/api/breakers/{DEVICE_ID}/switch/', {'state': 'on'}, format='json')
+        action_id = BreakerAction.objects.get().id
+
+        self.client.force_authenticate(self.stranger)
+        self.assertEqual(self.client.get('/api/breakers/actions/').json(), [])
+        self.assertEqual(
+            self.client.get(f'/api/breakers/actions/{action_id}/').status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_actions_cannot_be_written_through_the_api(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post('/api/breakers/actions/', {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
 class SigningTests(APITestCase):
     """The body must be signed byte-for-byte as it is sent."""
 
@@ -362,8 +468,8 @@ class SigningTests(APITestCase):
         credential.client_secret = 'secret'
         client = TuyaClient(credential)
 
-        empty = client._sign('POST', '/p', '1', 'tok', '')
-        with_body = client._sign('POST', '/p', '1', 'tok', '{"commands":[]}')
+        empty = client.sign('POST', '/p', '1', 'tok', '')
+        with_body = client.sign('POST', '/p', '1', 'tok', '{"commands":[]}')
         self.assertNotEqual(empty, with_body)
 
 
@@ -388,7 +494,7 @@ class ChildLockTests(APITestCase):
 
     @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
     @patch('apps.breakers.services.TuyaClient.get_device_properties',
-           return_value=props(True, child_lock=True))
+           side_effect=[props(True, child_lock=False), props(True, child_lock=True)])
     @patch('apps.breakers.services.TuyaClient.send_commands')
     def test_enabling_child_lock_writes_to_tuya_and_persists(self, send, _p, _s):
         self.client.force_authenticate(self.owner)
@@ -437,6 +543,148 @@ class ChildLockTests(APITestCase):
         )
         self.assertFalse(response.json()['confirmed'])
 
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties',
+           return_value=props(False, child_lock=True))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_locking_an_already_locked_breaker_says_so_and_sends_nothing(self, send, _p, _s):
+        self.client.force_authenticate(self.owner)
+        body = self.client.post(
+            f'/api/breakers/{DEVICE_ID}/child-lock/', {'enabled': True}, format='json'
+        ).json()
+
+        self.assertTrue(body['confirmed'])
+        self.assertFalse(body['changed'])
+        self.assertIn('already child-locked', body['reason'])
+        send.assert_not_called()
+        # A request that changed nothing is not an action worth logging.
+        self.assertFalse(BreakerAction.objects.filter(action='child_lock_on').exists())
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties',
+           return_value=props(True, child_lock=False))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_unlocking_an_already_unlocked_breaker_says_so_and_sends_nothing(self, send, _p, _s):
+        self.client.force_authenticate(self.owner)
+        body = self.client.post(
+            f'/api/breakers/{DEVICE_ID}/child-lock/', {'enabled': False}, format='json'
+        ).json()
+
+        self.assertTrue(body['confirmed'])
+        self.assertFalse(body['changed'])
+        self.assertIn('already unlocked', body['reason'])
+        send.assert_not_called()
+        self.assertFalse(BreakerAction.objects.filter(action='child_lock_off').exists())
+
+
+class CountdownTests(APITestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.owner = make_user('downer@example.com', 'home_user')
+        cls.stranger = make_user('dstranger@example.com', 'home_user')
+        cls.organization = Organization.objects.create(
+            name='Site I', phone='9', latitude=0, longitude=0, owner=cls.owner, status='active'
+        )
+        credential = TuyaCredential(organization=cls.organization, client_id='cid9', region='us')
+        credential.client_secret = 'secret'
+        credential.save()
+        Breaker.objects.create(device_id=DEVICE_ID, organization=cls.organization, priority=1)
+
+    def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties',
+           return_value=props(True, countdown=1800))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_countdown_is_sent_to_tuya_in_seconds(self, send, _p, _s):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f'/api/breakers/{DEVICE_ID}/countdown/', {'minutes': 30}, format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = response.json()
+        self.assertTrue(body['confirmed'])
+        self.assertEqual(body['remaining_s'], 1800)
+        self.assertEqual(body['action'], 'off')  # the breaker is on, so it will open
+        self.assertIsNotNone(body['switches_at'])
+        send.assert_called_once_with(DEVICE_ID, [{'code': 'countdown_1', 'value': 1800}])
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties',
+           return_value=props(True, countdown=0))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_zero_minutes_cancels_the_countdown(self, send, _p, _s):
+        self.client.force_authenticate(self.owner)
+        body = self.client.post(
+            f'/api/breakers/{DEVICE_ID}/countdown/', {'minutes': 0}, format='json'
+        ).json()
+
+        self.assertTrue(body['confirmed'])
+        self.assertIsNone(body['switches_at'])
+        self.assertIsNone(body['action'])
+        send.assert_called_once_with(DEVICE_ID, [{'code': 'countdown_1', 'value': 0}])
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties',
+           return_value=props(False, countdown=1800))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_countdown_on_an_open_breaker_schedules_a_close(self, send, _p, _s):
+        """The countdown toggles, so on an off breaker it is a delayed switch-on."""
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f'/api/breakers/{DEVICE_ID}/countdown/', {'minutes': 30}, format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = response.json()
+        self.assertTrue(body['confirmed'])
+        self.assertEqual(body['action'], 'on')
+        send.assert_called_once_with(DEVICE_ID, [{'code': 'countdown_1', 'value': 1800}])
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties',
+           return_value=props(True, child_lock=True, countdown=1800))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_child_locked_countdown_is_accepted_with_a_warning(self, send, _p, _s):
+        self.client.force_authenticate(self.owner)
+        body = self.client.post(
+            f'/api/breakers/{DEVICE_ID}/countdown/', {'minutes': 30}, format='json'
+        ).json()
+
+        self.assertTrue(body['confirmed'])
+        self.assertIn('warning', body)
+        send.assert_called_once_with(DEVICE_ID, [{'code': 'countdown_1', 'value': 1800}])
+
+    @patch('apps.breakers.services.CONFIRM_RETRY_DELAY', 0)
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties',
+           return_value=props(True, countdown=0))
+    @patch('apps.breakers.services.TuyaClient.send_commands')
+    def test_countdown_the_device_never_started_is_reported_unconfirmed(self, _send, _p, _s):
+        self.client.force_authenticate(self.owner)
+        body = self.client.post(
+            f'/api/breakers/{DEVICE_ID}/countdown/', {'minutes': 30}, format='json'
+        ).json()
+        self.assertFalse(body['confirmed'])
+
+    def test_countdown_beyond_the_tuya_cap_is_rejected(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.post(
+            f'/api/breakers/{DEVICE_ID}/countdown/', {'minutes': 1441}, format='json'
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_stranger_cannot_schedule_someone_elses_breaker(self):
+        self.client.force_authenticate(self.stranger)
+        response = self.client.post(
+            f'/api/breakers/{DEVICE_ID}/countdown/', {'minutes': 30}, format='json'
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
 
 class ChildLockLockoutTests(APITestCase):
     """The lock opens the relay and blocks commands until released."""
@@ -458,7 +706,7 @@ class ChildLockLockoutTests(APITestCase):
 
     @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
     @patch('apps.breakers.services.TuyaClient.get_device_properties',
-           return_value=props(False, child_lock=True))
+           side_effect=[props(True, child_lock=False), props(False, child_lock=True)])
     @patch('apps.breakers.services.TuyaClient.send_commands')
     def test_enabling_the_lock_warns_that_the_load_is_cut(self, send, _p, _s):
         self.client.force_authenticate(self.owner)
@@ -474,7 +722,7 @@ class ChildLockLockoutTests(APITestCase):
 
     @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
     @patch('apps.breakers.services.TuyaClient.get_device_properties',
-           return_value=props(True, child_lock=False))
+           side_effect=[props(False, child_lock=True), props(True, child_lock=False)])
     @patch('apps.breakers.services.TuyaClient.send_commands')
     def test_releasing_the_lock_carries_no_warning(self, _send, _p, _s):
         self.client.force_authenticate(self.owner)
@@ -497,3 +745,93 @@ class ChildLockLockoutTests(APITestCase):
 
         self.assertFalse(body['confirmed'])
         self.assertIn('child-locked', body['reason'])
+
+
+class OrganizationPollingTests(APITestCase):
+    """The poller is created by traffic and torn down by silence."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.owner = make_user('powner@example.com', 'home_user')
+        cls.organization = Organization.objects.create(
+            name='Site K', phone='11', latitude=0, longitude=0, owner=cls.owner, status='active'
+        )
+        credential = TuyaCredential(organization=cls.organization, client_id='cid11', region='us')
+        credential.client_secret = 'secret'
+        credential.save()
+        Breaker.objects.create(
+            device_id=DEVICE_ID, organization=cls.organization, priority=1
+        )
+
+    def setUp(self):
+        cache.clear()
+
+    @property
+    def schedule(self):
+        return PeriodicTask.objects.get(name=scheduling.schedule_name(self.organization.id))
+
+    def test_first_authenticated_request_creates_the_organizations_poller(self):
+        self.assertEqual(PeriodicTask.objects.count(), 0)
+
+        self.client.force_authenticate(self.owner)
+        self.client.get('/api/breakers/')
+
+        task = self.schedule
+        self.assertTrue(task.enabled)
+        self.assertEqual(task.task, scheduling.TASK_NAME)
+        self.assertEqual(task.interval.every, 30)
+        self.assertEqual(task.interval.period, 'seconds')
+        self.assertEqual(json.loads(task.args), [self.organization.id])
+
+    def test_anonymous_traffic_starts_nothing(self):
+        self.client.get('/api/breakers/')
+        self.assertEqual(PeriodicTask.objects.count(), 0)
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties', return_value=props(True))
+    def test_active_poller_caches_every_breaker_status(self, _p, _s):
+        scheduling.touch_organization(self.organization.id)
+
+        result = refresh_organization_breakers(self.organization.id)
+
+        self.assertEqual(result['refreshed'], 1)
+        self.assertEqual(result['failed'], 0)
+        self.assertTrue(scheduling.cached_status(DEVICE_ID)['is_on'])
+
+    def test_poller_switches_itself_off_once_the_organization_goes_idle(self):
+        scheduling.ensure_schedule(self.organization.id)  # no activity marker == idle
+
+        result = refresh_organization_breakers(self.organization.id)
+
+        self.assertEqual(result['stopped'], 'idle')
+        self.assertFalse(self.schedule.enabled)
+
+    def test_a_returning_user_restarts_a_stopped_poller(self):
+        scheduling.ensure_schedule(self.organization.id)
+        scheduling.disable_schedule(self.organization.id)
+        cache.clear()  # the re-check window has elapsed
+
+        self.client.force_authenticate(self.owner)
+        self.client.get('/api/breakers/')
+
+        self.assertTrue(self.schedule.enabled)
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties')
+    def test_status_endpoint_is_served_from_the_poller_cache(self, properties, _s):
+        scheduling.cache_status(DEVICE_ID, {'device_id': DEVICE_ID, 'is_on': True, 'from_cache': 1})
+
+        self.client.force_authenticate(self.owner)
+        body = self.client.get(f'/api/breakers/{DEVICE_ID}/status/').json()
+
+        self.assertEqual(body['from_cache'], 1)
+        properties.assert_not_called()
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties', return_value=props(True))
+    def test_raw_requests_bypass_the_cache_and_do_not_poison_it(self, _p, _s):
+        self.client.force_authenticate(self.owner)
+        body = self.client.get(f'/api/breakers/{DEVICE_ID}/status/?raw=1').json()
+
+        self.assertIn('raw', body)
+        self.assertIsNone(scheduling.cached_status(DEVICE_ID))

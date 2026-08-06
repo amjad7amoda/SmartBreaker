@@ -42,25 +42,27 @@ services:
       timeout: 3s
       retries: 10
 
-  web:
-    <<: *app
-    command: python manage.py runserver 0.0.0.0:8000
-    ports:
-      - "8000:8000"
-    restart: unless-stopped
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-      redis:
-        condition: service_healthy
+  # web:
+  #   <<: *app
+  #   command: sh -c "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000"
+  #   ports:
+  #     - "8000:8000"
+  #   restart: unless-stopped
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
 
   worker:
     <<: *app
     command: celery -A config worker -l info
+    # `web` applies the migrations. If these start first they may hit missing
+    # tables and exit; the restart policy brings them back once web is done.
     restart: unless-stopped
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      db:
+        condition: service_healthy
       redis:
         condition: service_healthy
 
@@ -69,8 +71,8 @@ services:
     command: celery -A config beat -l info
     restart: unless-stopped
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      db:
+        condition: service_healthy
       redis:
         condition: service_healthy
 

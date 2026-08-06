@@ -164,6 +164,12 @@ running event's required breakers forced ON within headroom
   group. No explicit "next group" state is kept; it falls out of recomputing
   headroom every cycle. Delegates the actual set-choice to the
   `grouping.py` plug-in (`first_group_within_headroom`).
+  For up to 15 candidates, that helper finds a minimum-group plan with exact
+  subset DP and reconstructs its group boundaries, then chooses the group
+  containing the highest-importance breaker. Larger candidate sets use a
+  priority-sum knapsack while its estimated work remains within the exact
+  branch's worst-case budget (`15 × 2^15`); oversized priority state spaces
+  fall back to the original deterministic importance-ordered greedy policy.
 
 ### 2.4 `day.deficit.power_saving`
 - **Purpose**: when PV can't cover the load and the user prefers self-

@@ -174,7 +174,7 @@ Experta separates a rule into:
 | Explainability | One stored branch code plus full input snapshot and intent reasons | Agenda/watchers can explain activations, but an application must persist a domain-level trace |
 | Safety precedence | Obvious in control flow and protected by early returns | Must be designed with salience, guard facts, halting, or control-state facts |
 | Combinatorial rules | Manual loops and helper functions | Natural strength: patterns across many fact combinations |
-| Optimization | Custom greedy grouping helpers | Not an optimizer; custom Python helpers would still be required |
+| Optimization | Bounded exact/knapsack startup grouping plus greedy shedding | Not an optimizer; custom Python helpers would still be required |
 | Database/framework coupling | Pure engine is dependency-free; adapter owns Django | Experta itself is independent, but integration code is still needed |
 | Runtime dependencies | Standard-library dataclasses in the pure engines | Additional Experta package and its transitive dependencies |
 | Unit testing | Directly fabricate dataclasses and assert one returned result | Reset engine, declare facts, run, and observe fired rules/facts/side effects |
@@ -379,10 +379,13 @@ optimization were wanted.
 
 #### Comfort and event turn-on
 
-Due comfort loads and required event loads are considered in importance
-order and added if each fits the reported headroom. Offline or faulted loads
-are not commanded ON; a `breaker_fault` alert is emitted instead. Locked-out
-loads are also not turned ON.
+Due comfort loads and required event loads are routed through a bounded
+three-level planner: exact subset DP for at most 15 candidates, priority-sum
+knapsack when its state space fits the exact branch's work budget, and
+importance-ordered greedy selection otherwise. The selected group is ordered
+by importance and must fit the reported headroom. Offline or faulted loads are
+not commanded ON; a `breaker_fault` alert is emitted instead. Locked-out loads
+are also not turned ON.
 
 Event-required loads are excluded from every normal shedding list. After
 most primary branches, `_ensure_event_required_on()` tries to turn missing

@@ -376,7 +376,8 @@ def _turn_on_due_comfort(facts, result, trace):
         included = breaker.id in selected_ids
         _step(trace, 'tier2.comfort.headroom', 'breaker_selection',
               'included' if included else 'excluded',
-              f'{breaker.device_id} {"fits" if included else "does not fit"} available inverter headroom.',
+              f'{breaker.device_id} {"was selected for" if included else "was deferred from"} '
+              'the current startup group.',
               device_id=breaker.device_id, draw=draw_W, unit='W',
               budget=facts.headroom_W, remaining_capacity=remaining_W)
         if included:
@@ -446,7 +447,8 @@ def _ensure_event_required_on(facts, result, trace):
         included = breaker.id in selected_ids
         _step(trace, 'tier2.event_required.headroom', 'breaker_selection',
               'included' if included else 'excluded',
-              f'{breaker.device_id} {"fits" if included else "does not fit"} event headroom.',
+              f'{breaker.device_id} {"was selected for" if included else "was deferred from"} '
+              'the current event startup group.',
               device_id=breaker.device_id,
               draw=breaker.expected_draw_W(facts.motor_peak_minutes),
               budget=facts.headroom_W, unit='W', protected=True)

@@ -1,7 +1,7 @@
 from django import forms
 from django.contrib import admin
 
-from .models import Breaker, TuyaCredential
+from .models import Breaker, BreakerReading, BreakerStatus, TuyaCredential
 
 
 class TuyaCredentialForm(forms.ModelForm):
@@ -41,9 +41,30 @@ class TuyaCredentialAdmin(admin.ModelAdmin):
 @admin.register(Breaker)
 class BreakerAdmin(admin.ModelAdmin):
     list_display = (
-        'name', 'device_id', 'organization', 'type', 'priority', 'protected', 'child_lock',
-        'peak_load', 'mean_load', 'cycle_start', 'cycle_end',
+        'name', 'device_id', 'organization', 'priority_type', 'priority_degree',
+        'load_type', 'peak_load_W', 'mean_load_W',
+        'cycle_start', 'cycle_end', 'locked_out',
     )
-    list_filter = ('type', 'protected', 'child_lock', 'organization')
+    list_filter = (
+        'priority_type', 'load_type', 'locked_out', 'child_lock', 'organization',
+    )
     search_fields = ('name', 'device_id', 'organization__name')
     readonly_fields = ('created_at',)
+
+
+@admin.register(BreakerStatus)
+class BreakerStatusAdmin(admin.ModelAdmin):
+    list_display = (
+        'breaker', 'switch', 'online', 'fault',
+        'cur_power_mW', 'cur_current_mA', 'cur_voltage_mV', 'reported_at',
+    )
+    list_filter = ('switch', 'online',)
+    search_fields = ('breaker__device_id',)
+    readonly_fields = ('reported_at',)
+
+
+@admin.register(BreakerReading)
+class BreakerReadingAdmin(admin.ModelAdmin):
+    list_display = ('breaker', 'timestamp', 'switch', 'cur_power_mW')
+    list_filter = ('switch',)
+    search_fields = ('breaker__device_id',)

@@ -12,4 +12,3 @@ channels
 channels-redis
 daphne
 python-dotenv
-vercel-wsgi

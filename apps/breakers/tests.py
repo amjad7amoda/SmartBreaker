@@ -50,7 +50,12 @@ class BreakerApiTests(APITestCase):
         credential.save()
 
     def create_payload(self, **overrides):
-        return {'device_id': DEVICE_ID, 'organization': self.organization.id, 'priority': 1, **overrides}
+        return {
+            'device_id': DEVICE_ID,
+            'organization': self.organization.id,
+            'priority_degree': 1,
+            **overrides,
+        }
 
     # --- permissions ---------------------------------------------------
 
@@ -73,8 +78,16 @@ class BreakerApiTests(APITestCase):
         self.assertNotIn('client_secret', response.json()[0])
 
     def test_home_user_only_sees_breakers_of_own_organizations(self):
-        Breaker.objects.create(device_id=DEVICE_ID, organization=self.organization, priority=1)
-        Breaker.objects.create(device_id='other-device', organization=self.other_organization, priority=1)
+        Breaker.objects.create(
+            device_id=DEVICE_ID,
+            organization=self.organization,
+            priority_degree=1,
+        )
+        Breaker.objects.create(
+            device_id='other-device',
+            organization=self.other_organization,
+            priority_degree=1,
+        )
 
         self.client.force_authenticate(self.owner)
         listed = [b['device_id'] for b in self.client.get('/api/breakers/').json()]
@@ -149,13 +162,21 @@ class UpdateTests(APITestCase):
         credential.save()
         cls.credential = credential
         cls.breaker = Breaker.objects.create(
-            device_id=DEVICE_ID, organization=cls.organization, priority=1
+            device_id=DEVICE_ID,
+            organization=cls.organization,
+            priority_degree=1,
         )
 
-    def test_patch_breaker_priority_only(self):
+    def test_patch_breaker_priority_degree_only(self):
         self.client.force_authenticate(self.technician)
-        response = self.client.patch(f'/api/breakers/{DEVICE_ID}/', {'priority': 5}, format='json')
+        response = self.client.patch(
+            f'/api/breakers/{DEVICE_ID}/',
+            {'priority_degree': 5},
+            format='json',
+        )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.breaker.refresh_from_db()
+        self.assertEqual(self.breaker.priority_degree, 5)
 
     def test_patch_breaker_cannot_change_device_id(self):
         self.client.force_authenticate(self.technician)
@@ -219,7 +240,11 @@ class StatusTests(APITestCase):
         credential = TuyaCredential(organization=cls.organization, client_id='cid5', region='us')
         credential.client_secret = 'secret'
         credential.save()
-        Breaker.objects.create(device_id=DEVICE_ID, organization=cls.organization, priority=1)
+        Breaker.objects.create(
+            device_id=DEVICE_ID,
+            organization=cls.organization,
+            priority_degree=1,
+        )
 
     def setUp(self):
         from django.core.cache import cache
@@ -294,7 +319,10 @@ class SwitchTests(APITestCase):
         credential.client_secret = 'secret'
         credential.save()
         Breaker.objects.create(
-            device_id=DEVICE_ID, organization=cls.organization, priority=1, protected=True
+            device_id=DEVICE_ID,
+            organization=cls.organization,
+            priority_degree=1,
+            priority_type='mandatory',
         )
 
     def setUp(self):
@@ -370,7 +398,9 @@ class ActionLogTests(APITestCase):
         credential = TuyaCredential(organization=cls.organization, client_id='cid10', region='us')
         credential.client_secret = 'secret'
         credential.save()
-        Breaker.objects.create(device_id=DEVICE_ID, organization=cls.organization, priority=1)
+        Breaker.objects.create(
+            device_id=DEVICE_ID, organization=cls.organization, priority_degree=1,
+        )
 
     def setUp(self):
         from django.core.cache import cache
@@ -485,7 +515,9 @@ class ChildLockTests(APITestCase):
         credential.client_secret = 'secret'
         credential.save()
         cls.breaker = Breaker.objects.create(
-            device_id=DEVICE_ID, organization=cls.organization, priority=1
+            device_id=DEVICE_ID,
+            organization=cls.organization,
+            priority_degree=1,
         )
 
     def setUp(self):
@@ -589,7 +621,9 @@ class CountdownTests(APITestCase):
         credential = TuyaCredential(organization=cls.organization, client_id='cid9', region='us')
         credential.client_secret = 'secret'
         credential.save()
-        Breaker.objects.create(device_id=DEVICE_ID, organization=cls.organization, priority=1)
+        Breaker.objects.create(
+            device_id=DEVICE_ID, organization=cls.organization, priority_degree=1,
+        )
 
     def setUp(self):
         from django.core.cache import cache
@@ -698,7 +732,11 @@ class ChildLockLockoutTests(APITestCase):
         credential = TuyaCredential(organization=cls.organization, client_id='cid8', region='us')
         credential.client_secret = 'secret'
         credential.save()
-        Breaker.objects.create(device_id=DEVICE_ID, organization=cls.organization, priority=1)
+        Breaker.objects.create(
+            device_id=DEVICE_ID,
+            organization=cls.organization,
+            priority_degree=1,
+        )
 
     def setUp(self):
         from django.core.cache import cache
@@ -760,7 +798,7 @@ class OrganizationPollingTests(APITestCase):
         credential.client_secret = 'secret'
         credential.save()
         Breaker.objects.create(
-            device_id=DEVICE_ID, organization=cls.organization, priority=1
+            device_id=DEVICE_ID, organization=cls.organization, priority_degree=1
         )
 
     def setUp(self):
@@ -835,3 +873,93 @@ class OrganizationPollingTests(APITestCase):
 
         self.assertIn('raw', body)
         self.assertIsNone(scheduling.cached_status(DEVICE_ID))
+
+
+class SimulatorStatusIngestTests(APITestCase):
+    """The simulator bulk endpoint updates the adapter's source tables."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.owner = make_user('sim-owner@example.com', 'home_user')
+        cls.organization = Organization.objects.create(
+            name='Simulator Site', phone='9', latitude=0, longitude=0,
+            owner=cls.owner, status='active',
+        )
+        cls.breaker = Breaker.objects.create(
+            device_id='sim-breaker-1',
+            organization=cls.organization,
+            priority_degree=2,
+        )
+
+    @staticmethod
+    def payload(device_id='sim-breaker-1', **overrides):
+        return [{
+            'device_id': device_id,
+            'timestamp': '2026-08-03T09:15:00Z',
+            'switch': True,
+            'countdown_1_s': 0,
+            'cur_current_mA': 3500,
+            'cur_power_mW': 875000,
+            'cur_voltage_mV': 250000,
+            'fault': '',
+            'relay_status': 'last',
+            'child_lock': True,
+            'cycle_time': '',
+            'online': True,
+            **overrides,
+        }]
+
+    def test_bulk_status_creates_status_and_history(self):
+        from .models import BreakerReading, BreakerStatus
+
+        response = self.client.post(
+            '/api/breakers/status/', self.payload(), format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json(), {'received': 1, 'readings_created': 1})
+        current = BreakerStatus.objects.get(breaker=self.breaker)
+        self.assertTrue(current.switch)
+        self.assertTrue(current.online)
+        self.assertEqual(current.cur_power_mW, 875000)
+        self.assertEqual(
+            current.last_switched_on_at.isoformat(),
+            '2026-08-03T09:15:00+00:00',
+        )
+        self.breaker.refresh_from_db()
+        self.assertTrue(self.breaker.child_lock)
+        self.assertTrue(
+            BreakerReading.objects.filter(breaker=self.breaker).exists()
+        )
+
+    def test_replayed_timestamp_is_idempotent(self):
+        from .models import BreakerReading
+
+        first = self.client.post(
+            '/api/breakers/status/', self.payload(), format='json'
+        )
+        second = self.client.post(
+            '/api/breakers/status/', self.payload(), format='json'
+        )
+
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second.json()['readings_created'], 0)
+        self.assertEqual(BreakerReading.objects.count(), 1)
+
+    def test_unknown_device_rejects_whole_batch(self):
+        from .models import BreakerStatus
+
+        batch = self.payload() + self.payload(device_id='missing-device')
+        response = self.client.post(
+            '/api/breakers/status/', batch, format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(BreakerStatus.objects.exists())
+
+    def test_duplicate_device_in_batch_is_rejected(self):
+        response = self.client.post(
+            '/api/breakers/status/', self.payload() * 2, format='json'
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

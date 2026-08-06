@@ -22,6 +22,7 @@ CHILD_LOCK_CODE = 'child_lock'
 
 COUNTDOWN_CODE = 'countdown_1'
 MAX_COUNTDOWN_MINUTES = 1440  # Tuya caps countdown_1 at 86400 seconds.
+MAX_COUNTDOWN_SECONDS = MAX_COUNTDOWN_MINUTES * 60
 
 CONFIRM_RETRY_DELAY = 0.6
 
@@ -91,6 +92,29 @@ def record_action(breaker, action, result, source, actor=None, reason=''):
         breaker_status=result.get('status'),
     )
 
+
+def tier1_interlock_reason(breaker, turn_on):
+    """Return a reason when Tier-1 currently forbids energizing this load."""
+    if not turn_on or breaker.priority_type == 'ac_grid':
+        return ''
+
+    # Lazy import prevents the breaker model/service layer from creating an
+    # import cycle with the KBS adapter.
+    from apps.kbs.models import Tier1SafetyState
+
+    safety = Tier1SafetyState.objects.filter(
+        organization_id=breaker.organization_id,
+        active=True,
+    ).only('situation').first()
+    if safety is None:
+        return ''
+    situation = safety.situation or 'active danger'
+    return (
+        f'Tier-1 safety interlock is active ({situation}); '
+        'non-grid loads cannot be switched on until the danger clears.'
+    )
+
+
 def write_and_confirm(breaker, write_code, value, status_key):
     client = client_for(breaker)
     client.send_commands(breaker.device_id, [{'code': write_code, 'value': value}])
@@ -103,6 +127,24 @@ def write_and_confirm(breaker, write_code, value, status_key):
 
 def set_switch(breaker, turn_on, source='manual', actor=None, reason=''):
     turn_on = bool(turn_on)
+    interlock_reason = tier1_interlock_reason(breaker, turn_on)
+    if interlock_reason:
+        result = {
+            'device_id': breaker.device_id,
+            'requested': 'on',
+            'confirmed': False,
+            'blocked': True,
+            'reason': interlock_reason,
+            'status': None,
+        }
+        audit_reason = '; '.join(
+            item for item in (reason, interlock_reason) if item
+        )
+        record_action(
+            breaker, 'switch_on', result, source, actor, audit_reason,
+        )
+        return result
+
     status = write_and_confirm(breaker, SWITCH_WRITE_CODE, turn_on, 'is_on')
 
     result = {
@@ -172,8 +214,68 @@ def countdown_confirmed(status, seconds):
     remaining = status['countdown_s'] or 0
     return remaining == 0 if seconds == 0 else remaining > 0
 
-def set_countdown(breaker, minutes, source='manual', actor=None, reason=''):
-    seconds = int(minutes) * 60
+
+def set_countdown_seconds(
+    breaker,
+    seconds,
+    source='manual',
+    actor=None,
+    reason='',
+    desired_state=None,
+):
+    """Set Tuya's second-based relay timer.
+
+    desired_state is used by the KBS executor to make the toggle idempotent.
+    The public Backend V1 API leaves it unset and retains toggle semantics.
+    """
+    seconds = int(seconds)
+    if not 0 <= seconds <= MAX_COUNTDOWN_SECONDS:
+        raise ValueError(
+            f'countdown must be between 0 and {MAX_COUNTDOWN_SECONDS} seconds',
+        )
+
+    current = read_status(breaker)
+    if (
+        seconds
+        and desired_state is not None
+        and current.get('is_on') is bool(desired_state)
+    ):
+        return {
+            'device_id': breaker.device_id,
+            'requested_seconds': seconds,
+            'requested_minutes': seconds / 60,
+            'confirmed': True,
+            'changed': False,
+            'remaining_s': current.get('countdown_s') or 0,
+            'action': None,
+            'switches_at': None,
+            'status': current,
+        }
+
+    will_turn_on = seconds > 0 and current.get('is_on') is not True
+    interlock_reason = tier1_interlock_reason(breaker, will_turn_on)
+    if interlock_reason:
+        result = {
+            'device_id': breaker.device_id,
+            'requested_seconds': seconds,
+            'requested_minutes': seconds / 60,
+            'confirmed': False,
+            'blocked': True,
+            'changed': False,
+            'remaining_s': current.get('countdown_s') or 0,
+            'action': 'on',
+            'switches_at': None,
+            'reason': interlock_reason,
+            'status': current,
+        }
+        audit_reason = '; '.join(
+            item for item in (reason, interlock_reason) if item
+        )
+        record_action(
+            breaker, 'countdown_set', result, source, actor, audit_reason,
+        )
+        return result
+
     client = client_for(breaker)
     client.send_commands(breaker.device_id, [{'code': COUNTDOWN_CODE, 'value': seconds}])
 
@@ -185,8 +287,10 @@ def set_countdown(breaker, minutes, source='manual', actor=None, reason=''):
     remaining = status['countdown_s'] or 0
     result = {
         'device_id': breaker.device_id,
-        'requested_minutes': minutes,
+        'requested_seconds': seconds,
+        'requested_minutes': seconds // 60 if seconds % 60 == 0 else seconds / 60,
         'confirmed': countdown_confirmed(status, seconds),
+        'changed': True,
         'remaining_s': remaining,
         # Tuya's countdown toggles the relay rather than opening it. This status was
         # read after the write but before expiry, so is_on is still the state the
@@ -205,6 +309,17 @@ def set_countdown(breaker, minutes, source='manual', actor=None, reason=''):
 
     record_action(breaker, 'countdown_set' if seconds else 'countdown_cancel', result, source, actor, reason)
     return result
+
+
+def set_countdown(breaker, minutes, source='manual', actor=None, reason=''):
+    return set_countdown_seconds(
+        breaker,
+        int(minutes) * 60,
+        source=source,
+        actor=actor,
+        reason=reason,
+    )
+
 
 def read_status(breaker, include_raw=False):
     client = client_for(breaker)

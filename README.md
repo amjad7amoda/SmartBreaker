@@ -1,16 +1,18 @@
 # Smart Breaker
 
-Backend for the Smart Breaker platform: Django + Django REST Framework, JWT auth,
-Celery/Redis for async work, Postgres for storage.
+Backend and knowledge-based control service for the Smart Breaker platform:
+Django + Django REST Framework, JWT auth, Celery/Redis for async work, Postgres
+for storage, and coordinated Tier-1/Tier-2 breaker control.
 
 ## Tech stack
 
 - **Django 6** / **Django REST Framework** — API layer
 - **PostgreSQL** — primary database
 - **djangorestframework-simplejwt** — JWT authentication
-- **Celery + Redis** — asynchronous tasks (currently: transactional email)
+- **Celery + Redis** — email, polling, KBS cycles and device-action execution
 - **Channels / Daphne** — reserved for realtime features (installed, not yet wired up)
 - **django-cors-headers** — CORS
+- **Tier-2 KBS + Tier-1 interlock** — auditable decisions with real-site Tuya execution
 
 ## Project layout
 
@@ -18,7 +20,10 @@ Celery/Redis for async work, Postgres for storage.
 config/                Django project (settings, root urls, celery app, wsgi/asgi)
 apps/accounts/          Users, registration approval, OTP login, password reset
 apps/organizations/      Organizations (multi-tenancy), admin approval
-docker-compose.yml       Local Redis for Celery
+apps/kbs/                Tier-2 engine, Django adapter, audit API and action executor
+edge/                    Tier-1 safety engine, audit spool and backend bridge
+simulator/               Browser simulator and real-world scenario data
+docker-compose.yml       Local Redis and Postgres
 requirements.txt         Python dependencies
 manage.py
 ```
@@ -52,34 +57,44 @@ Settings are split under `config/settings/`: `base.py` (shared), `development.py
    Both dev and prod send real email via SMTP (no console backend) — without valid
    `EMAIL_HOST_*` credentials, outgoing mail (OTPs, approval/denial notices, password
    resets) will fail to send.
-3. **Start Postgres**, matching the `DB_*` values in `.env`.
-4. **Start Redis** (broker for Celery):
+3. **Start Postgres and Redis** (database, cache, Celery broker):
    ```bash
-   docker compose up -d redis
+   docker compose up -d postgres redis
    ```
-5. **Run migrations**
+4. **Run migrations**
    ```bash
    python manage.py migrate
    ```
-6. **Create the first admin account** — admins can *only* be created this way, never
+5. **Create the first admin account** — admins can *only* be created this way, never
    through the API or Django admin "Add" button:
    ```bash
    python manage.py createsuperuser
    ```
-7. **Run the server**
+6. **Run the server**
    ```bash
    python manage.py runserver
    ```
-8. **Run the Celery worker** (needed for emails to actually send — without it, tasks
-   queue in Redis but never execute):
+7. **Run the Celery worker** (needed for email, polling, KBS cycles and real-site
+   breaker actions):
    ```bash
    celery -A config worker -l info
    ```
+8. **Run Celery beat** (dispatches per-site polling and Tier-2 cycles):
+   ```bash
+   celery -A config beat -l info
+   ```
+
+For a real site, configure its Tuya credentials, set `KBSSettings.data_source`
+to `real`, and set its mode to `active`. A committed KBS intent is then queued
+through `apps.kbs.executor`, which uses the Backend V1 Tuya services and records
+both the KBS outcome and the device-action audit. Simulator intents remain local
+and can only be acknowledged through the simulator API.
 
 ## Running tests
 
 ```bash
-python manage.py test apps.accounts.tests apps.organizations.tests
+DJANGO_SETTINGS_MODULE=config.settings.test python manage.py test
+python3 -m unittest edge.test_tier1_kbs edge.test_simulator_bridge edge.test_audit
 ```
 
 Tests use `CELERY_TASK_ALWAYS_EAGER=True` and Django's `locmem` email backend, so the

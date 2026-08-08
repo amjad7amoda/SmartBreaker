@@ -29,7 +29,7 @@ makes every rule unit-testable with fabricated facts.
 | `battery_voltage_V`, `battery_capacity_percent` | the two views of battery health: voltage protects hardware, percent (SoC) drives strategy | inverter reading |
 | `heatsink_temp_C` | inverter hardware stress signal | inverter reading |
 | `grid_breaker_on`, `grid_energized` | whether the AC-grid breaker is closed, and whether the state grid is actually live | breaker status + inverter grid-voltage register |
-| `breakers` (`list[BreakerFacts]`) | per-breaker state this cycle: priority, switch position, health, schedule window, lockout | `Breaker` + `BreakerStatus` joined |
+| `breakers` (`tuple[BreakerFacts, ...]`) | per-breaker state this cycle: priority, switch position, health, schedule window, lockout | `Breaker` + `BreakerStatus` joined by the backend adapter |
 
 Every `BreakerFacts` carries `priority_type`/`priority_degree` (the shedding
 order key), `load_type` + `peak_load_W`/`mean_load_W` (for headroom math),
@@ -164,6 +164,12 @@ running event's required breakers forced ON within headroom
   group. No explicit "next group" state is kept; it falls out of recomputing
   headroom every cycle. Delegates the actual set-choice to the
   `grouping.py` plug-in (`first_group_within_headroom`).
+  For up to 15 candidates, that helper finds a minimum-group plan with exact
+  subset DP and reconstructs its group boundaries, then chooses the group
+  containing the highest-importance breaker. Larger candidate sets use a
+  priority-sum knapsack while its estimated work remains within the exact
+  branch's worst-case budget (`15 × 2^15`); oversized priority state spaces
+  fall back to the original deterministic importance-ordered greedy policy.
 
 ### 2.4 `day.deficit.power_saving`
 - **Purpose**: when PV can't cover the load and the user prefers self-
@@ -344,9 +350,9 @@ running event's required breakers forced ON within headroom
   automatically inherits correct event/health/window behavior for free.
 - **`decide()` is pure** — it takes a frozen `SystemFacts` and returns
   `RuleResult` (actions + alerts), so the tree above is the *entire*
-  reasoning of the server engine; `actions.py` (persist), `facts.py`
-  (gather), and Celery (schedule) are plumbing around it, not additional
-  logic.
+  reasoning of the server engine. `apps/kbs/adapters/django.py` gathers facts
+  and persists results, `apps/kbs/services.py` orchestrates the boundary, and
+  Celery schedules it; none of that backend plumbing adds decision logic.
 
 ---
 

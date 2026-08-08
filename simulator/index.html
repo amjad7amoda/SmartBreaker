@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SmartBreaker Simulator</title>
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="decision-logs.css">
 </head>
 <body>
 <aside class="app-sidebar" aria-label="Primary navigation">
@@ -358,6 +359,32 @@
       </div>
       <span class="view-badge">Real Python engines</span>
     </div>
+
+    <section class="panel decision-log-panel" id="panel-decision-logs">
+      <div class="panel-heading">
+        <div>
+          <h3>Saved decision logs</h3>
+          <span class="panel-subtitle">Persistent Tier-1 and Tier-2 audit paths</span>
+        </div>
+        <button id="btn-decision-logs-refresh" class="small-button">Refresh</button>
+      </div>
+      <div class="decision-log-toolbar">
+        <label>JWT access token
+          <input id="inp-decision-token" type="password" autocomplete="off" placeholder="Paste access token">
+        </label>
+        <label>Tier
+          <select id="inp-decision-tier">
+            <option value="">All tiers</option>
+            <option value="tier1">Tier 1</option>
+            <option value="tier2">Tier 2</option>
+          </select>
+        </label>
+      </div>
+      <div id="decision-log-status" class="decision-log-status">
+        Enter a JWT access token and refresh to load saved decisions.
+      </div>
+      <div id="decision-log-cards" class="decision-log-cards"></div>
+    </section>
 
     <section class="panel evidence-panel" id="panel-evidence">
       <div class="panel-heading">

@@ -1,146 +1,205 @@
-from rest_framework import generics, mixins
+from django.db import transaction
+from rest_framework import generics, status
 from rest_framework.exceptions import ValidationError
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
-from apps.accounts.permissions import IsTechnicianOrAdmin
+from apps.accounts.permissions import (
+    IsTechnicianOrAdmin,
+    IsTechnicianOrAdminOrReadOnly,
+)
 
-from . import exceptions, services
-from .models import Breaker, TuyaCredential
-from .tuya import TuyaError
+from . import exceptions, scheduling, services
+from .models import (
+    Breaker,
+    BreakerAction,
+    BreakerReading,
+    BreakerStatus,
+    TuyaCredential,
+)
 from .serializers import (
+    BreakerActionSerializer,
     BreakerChildLockSerializer,
+    BreakerCountdownSerializer,
     BreakerCreateSerializer,
     BreakerSerializer,
+    BreakerStatusIngestSerializer,
     BreakerSwitchSerializer,
     BreakerUpdateSerializer,
     TuyaCredentialSerializer,
 )
+from .tuya import TuyaError
 
 
-class OrganizationScopedMixin:
-    organization_lookup = 'organization'
-
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        user = self.request.user
-        if user.role in ('technician', 'admin'):
-            return queryset
-        return queryset.filter(**{f'{self.organization_lookup}__owner': user})
-
-
-class TechnicianWritesMixin:
-    """Reading is open to any authenticated user; writing is technician/admin only."""
-
-    def get_permissions(self):
-        if self.request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
-            return [IsAuthenticated(), IsTechnicianOrAdmin()]
-        return [IsAuthenticated()]
-
-
-class TuyaCredentialListCreateView(
-    mixins.ListModelMixin, mixins.CreateModelMixin, generics.GenericAPIView
-):
-    # Credentials are pure configuration, so even reading them is staff-only.
-    permission_classes = [IsAuthenticated, IsTechnicianOrAdmin]
-    serializer_class = TuyaCredentialSerializer
-    queryset = TuyaCredential.objects.select_related('organization')
-
-    def get(self, request, *args, **kwargs):
-        return self.list(request, *args, **kwargs)
-
-    def post(self, request, *args, **kwargs):
-        return self.create(request, *args, **kwargs)
-
-
-class TuyaCredentialDetailView(
-    mixins.RetrieveModelMixin,
-    mixins.UpdateModelMixin,
-    mixins.DestroyModelMixin,
-    generics.GenericAPIView,
-):
-    permission_classes = [IsAuthenticated, IsTechnicianOrAdmin]
-    serializer_class = TuyaCredentialSerializer
-    queryset = TuyaCredential.objects.select_related('organization')
-
-    def get(self, request, *args, **kwargs):
-        return self.retrieve(request, *args, **kwargs)
-
-    def patch(self, request, *args, **kwargs):
-        return self.partial_update(request, *args, **kwargs)
-
-    def put(self, request, *args, **kwargs):
-        return self.update(request, *args, **kwargs)
-
-    def delete(self, request, *args, **kwargs):
-        return self.destroy(request, *args, **kwargs)
-
-
-class BreakerListCreateView(
-    TechnicianWritesMixin,
-    OrganizationScopedMixin,
-    mixins.ListModelMixin,
-    mixins.CreateModelMixin,
-    generics.GenericAPIView,
-):
+def scoped_breakers(user):
     queryset = Breaker.objects.select_related('organization')
+    if user.role in ('technician', 'admin'):
+        return queryset
+    return queryset.filter(organization__owner=user)
+
+
+class BreakerStatusIngestView(APIView):
+    """Ingest one simulator/Pi snapshot for every breaker in the payload."""
+
+    permission_classes = [AllowAny]
+
+    @transaction.atomic
+    def post(self, request):
+        serializer = BreakerStatusIngestSerializer(
+            data=request.data,
+            allow_empty=False,
+        )
+        serializer.is_valid(raise_exception=True)
+
+        items = serializer.validated_data
+        breakers = {
+            breaker.device_id: breaker
+            for breaker in Breaker.objects.select_for_update().filter(
+                device_id__in=[item['device_id'] for item in items],
+            )
+        }
+        readings_created = 0
+        for item in items:
+            breaker = breakers[item['device_id']]
+            status_row, _ = (
+                BreakerStatus.objects.select_for_update().get_or_create(
+                    breaker=breaker,
+                )
+            )
+            previous_switch = status_row.switch
+            status_row.switch = item['switch']
+            status_row.countdown_1_s = item['countdown_1_s']
+            status_row.cur_current_mA = item.get('cur_current_mA')
+            status_row.cur_power_mW = item.get('cur_power_mW')
+            status_row.cur_voltage_mV = item.get('cur_voltage_mV')
+            status_row.fault = item['fault']
+            status_row.relay_status = item['relay_status']
+            status_row.child_lock = item['child_lock']
+            status_row.cycle_time = item['cycle_time']
+            status_row.online = item['online']
+            if item['switch'] and not previous_switch:
+                status_row.last_switched_on_at = item['timestamp']
+            status_row.save()
+
+            if breaker.child_lock != item['child_lock']:
+                breaker.child_lock = item['child_lock']
+                breaker.save(update_fields=['child_lock'])
+
+            _, created = BreakerReading.objects.get_or_create(
+                breaker=breaker,
+                timestamp=item['timestamp'],
+                defaults={
+                    'switch': item['switch'],
+                    'cur_power_mW': item.get('cur_power_mW'),
+                },
+            )
+            readings_created += int(created)
+
+        return Response(
+            {
+                'received': len(items),
+                'readings_created': readings_created,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class TuyaCredentialListCreateView(generics.ListCreateAPIView):
+    permission_classes = [IsAuthenticated, IsTechnicianOrAdmin]
+    serializer_class = TuyaCredentialSerializer
+    queryset = TuyaCredential.objects.select_related('organization')
+
+
+class TuyaCredentialDetailView(generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [IsAuthenticated, IsTechnicianOrAdmin]
+    serializer_class = TuyaCredentialSerializer
+    queryset = TuyaCredential.objects.select_related('organization')
+
+
+class BreakerListCreateView(generics.ListCreateAPIView):
+    permission_classes = [IsTechnicianOrAdminOrReadOnly]
 
     def get_serializer_class(self):
-        return BreakerCreateSerializer if self.request.method == 'POST' else BreakerSerializer
+        if self.request.method == 'POST':
+            return BreakerCreateSerializer
+        return BreakerSerializer
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = scoped_breakers(self.request.user)
         organization = self.request.query_params.get('organization')
-        return queryset.filter(organization_id=organization) if organization else queryset
-
-    def get(self, request, *args, **kwargs):
-        return self.list(request, *args, **kwargs)
-
-    def post(self, request, *args, **kwargs):
-        return self.create(request, *args, **kwargs)
+        if organization:
+            queryset = queryset.filter(organization_id=organization)
+        return queryset
 
 
-class BreakerStatusView(OrganizationScopedMixin, generics.GenericAPIView):
-    permission_classes = [IsAuthenticated]
-    serializer_class = BreakerSerializer
-    queryset = Breaker.objects.select_related('organization')
+class BreakerDetailView(generics.RetrieveUpdateAPIView):
+    permission_classes = [IsTechnicianOrAdminOrReadOnly]
     lookup_field = 'device_id'
 
-    def get(self, request, *args, **kwargs):
+    def get_serializer_class(self):
+        if self.request.method == 'GET':
+            return BreakerSerializer
+        return BreakerUpdateSerializer
+
+    def get_queryset(self):
+        return scoped_breakers(self.request.user)
+
+
+class BreakerDeleteView(generics.DestroyAPIView):
+    permission_classes = [IsAuthenticated, IsTechnicianOrAdmin]
+    lookup_field = 'device_id'
+
+    def get_queryset(self):
+        return scoped_breakers(self.request.user)
+
+
+class BreakerStatusView(generics.RetrieveAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = BreakerSerializer
+    lookup_field = 'device_id'
+
+    def get_queryset(self):
+        return scoped_breakers(self.request.user)
+
+    def retrieve(self, request, *args, **kwargs):
         breaker = self.get_object()
         include_raw = request.query_params.get('raw') in ('1', 'true')
+        if not include_raw:
+            cached = scheduling.cached_status(breaker.device_id)
+            if cached is not None:
+                return Response(cached)
+
         try:
-            status = services.read_status(breaker, include_raw=include_raw)
+            breaker_status = services.read_status(
+                breaker, include_raw=include_raw,
+            )
         except LookupError as exc:
             raise ValidationError({'organization': str(exc)})
         except TuyaError as exc:
             raise exceptions.translate(exc, field='device_id')
-        return Response(status)
+        return Response(breaker_status)
 
 
-class DeviceActionMixin(OrganizationScopedMixin):
-    """Resolves a scoped breaker and runs one Tuya write against it.
-
-    Permission is carried entirely by the queryset scoping: technicians and
-    admins are unscoped, and a home user can only resolve breakers belonging to
-    an organization they own, so an unrelated device is a 404 rather than a
-    controllable target.
-    """
-
+class BreakerSwitchView(generics.GenericAPIView):
     permission_classes = [IsAuthenticated]
-    queryset = Breaker.objects.select_related('organization')
+    serializer_class = BreakerSwitchSerializer
     lookup_field = 'device_id'
 
-    def perform_action(self, breaker, serializer):
-        raise NotImplementedError
+    def get_queryset(self):
+        return scoped_breakers(self.request.user)
 
     def post(self, request, *args, **kwargs):
         breaker = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
         try:
-            result = self.perform_action(breaker, serializer)
+            result = services.set_switch(
+                breaker,
+                serializer.turn_on,
+                actor=request.user,
+                reason=serializer.validated_data['reason'],
+            )
         except LookupError as exc:
             raise ValidationError({'organization': str(exc)})
         except TuyaError as exc:
@@ -148,44 +207,91 @@ class DeviceActionMixin(OrganizationScopedMixin):
         return Response(result)
 
 
-class BreakerSwitchView(DeviceActionMixin, generics.GenericAPIView):
-    serializer_class = BreakerSwitchSerializer
+class BreakerChildLockView(generics.GenericAPIView):
+    """Engage the physical device lockout, which also opens the relay."""
 
-    def perform_action(self, breaker, serializer):
-        return services.set_switch(breaker, serializer.turn_on)
-
-
-class BreakerChildLockView(DeviceActionMixin, generics.GenericAPIView):
-    """Engages the device lockout, which also opens the relay until released."""
-
+    permission_classes = [IsAuthenticated]
     serializer_class = BreakerChildLockSerializer
-
-    def perform_action(self, breaker, serializer):
-        return services.set_child_lock(breaker, serializer.validated_data['enabled'])
-
-
-class BreakerDetailView(
-    TechnicianWritesMixin,
-    OrganizationScopedMixin,
-    mixins.RetrieveModelMixin,
-    mixins.UpdateModelMixin,
-    mixins.DestroyModelMixin,
-    generics.GenericAPIView,
-):
-    queryset = Breaker.objects.select_related('organization')
     lookup_field = 'device_id'
 
-    def get_serializer_class(self):
-        return BreakerSerializer if self.request.method == 'GET' else BreakerUpdateSerializer
+    def get_queryset(self):
+        return scoped_breakers(self.request.user)
 
-    def get(self, request, *args, **kwargs):
-        return self.retrieve(request, *args, **kwargs)
+    def post(self, request, *args, **kwargs):
+        breaker = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            result = services.set_child_lock(
+                breaker,
+                serializer.validated_data['enabled'],
+                actor=request.user,
+                reason=serializer.validated_data['reason'],
+            )
+        except LookupError as exc:
+            raise ValidationError({'organization': str(exc)})
+        except TuyaError as exc:
+            raise exceptions.translate(exc, field='device_id')
+        return Response(result)
 
-    def patch(self, request, *args, **kwargs):
-        return self.partial_update(request, *args, **kwargs)
 
-    def put(self, request, *args, **kwargs):
-        return self.update(request, *args, **kwargs)
+class BreakerCountdownView(generics.GenericAPIView):
+    """Tell the device to flip its relay after the requested delay."""
 
-    def delete(self, request, *args, **kwargs):
-        return self.destroy(request, *args, **kwargs)
+    permission_classes = [IsAuthenticated]
+    serializer_class = BreakerCountdownSerializer
+    lookup_field = 'device_id'
+
+    def get_queryset(self):
+        return scoped_breakers(self.request.user)
+
+    def post(self, request, *args, **kwargs):
+        breaker = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            result = services.set_countdown(
+                breaker,
+                serializer.validated_data['minutes'],
+                actor=request.user,
+                reason=serializer.validated_data['reason'],
+            )
+        except LookupError as exc:
+            raise ValidationError({'organization': str(exc)})
+        except TuyaError as exc:
+            raise exceptions.translate(exc, field='device_id')
+        return Response(result)
+
+
+class BreakerActionListView(generics.ListAPIView):
+    """Read-only actual-device command audit."""
+
+    permission_classes = [IsAuthenticated]
+    serializer_class = BreakerActionSerializer
+
+    def get_queryset(self):
+        queryset = BreakerAction.objects.filter(
+            breaker__in=scoped_breakers(self.request.user),
+        ).select_related('breaker', 'actor')
+
+        params = self.request.query_params
+        for field, lookup in (
+            ('device_id', 'breaker__device_id'),
+            ('organization', 'breaker__organization_id'),
+            ('action', 'action'),
+            ('source', 'source'),
+        ):
+            value = params.get(field)
+            if value:
+                queryset = queryset.filter(**{lookup: value})
+        return queryset
+
+
+class BreakerActionDetailView(generics.RetrieveAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = BreakerActionSerializer
+
+    def get_queryset(self):
+        return BreakerAction.objects.filter(
+            breaker__in=scoped_breakers(self.request.user),
+        ).select_related('breaker', 'actor')

@@ -6,20 +6,12 @@ psycopg2-binary
 cryptography
 requests
 celery
+django-celery-beat
 redis
 channels
 channels-redis
 daphne
 python-dotenv
-vercel-wsgi
-
-# --- KBS rule engine ------------------------------------------------------
-# Experta 1.9.4 (2018) is the last release and pins frozendict==1.2, whose
-# module body still uses `collections.Mapping` — removed in Python 3.10, so
-# importing experta fails out of the box. frozendict 2.x exports the same
-# `frozendict` symbol experta imports, so it is a drop-in replacement, but pip
-# will not resolve it against the stale pin. Install it separately, AFTER this
-# file:
-#     pip install -r requirements.txt
-#     pip install --no-deps --upgrade "frozendict>=2.4"
-experta
+# Not on PyPI — pip cannot resolve it, which breaks `pip install -r requirements.txt`
+# everywhere (Docker build included). Only api/index.py needs it, for Vercel.
+# vercel-wsgi

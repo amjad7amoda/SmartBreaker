@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 
 from apps.organizations.models import Organization
@@ -54,30 +55,95 @@ class Breaker(models.Model):
         ('ac_grid', 'AC Grid'),      # ON = site draws state-grid electricity
     ]
 
+    CATEGORY_RANK = {'comfort': 1, 'normal': 2, 'mandatory': 3}
+
+    LOAD_TYPE_CHOICES = [
+        ('motor', 'Motor'),
+        ('normal', 'Normal'),
+    ]
+
     device_id = models.CharField(max_length=100, unique=True)
-    organization= models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='breakers')
-    type= models.CharField(max_length=20, choices=TYPE_CHOICES, default='normal')
-    priority= models.PositiveIntegerField()
-    protected= models.BooleanField(default=False)
+    name = models.CharField(max_length=100, blank=True)
+    organization = models.ForeignKey(
+        Organization, on_delete=models.CASCADE, related_name='breakers'
+    )
+    priority_type = models.CharField(
+        max_length=20, choices=PRIORITY_TYPE_CHOICES, default='normal'
+    )
+    priority_degree = models.PositiveIntegerField(default=1)
+    load_type = models.CharField(
+        max_length=20, choices=LOAD_TYPE_CHOICES, default='normal'
+    )
     # Mirrors the device's physical button lock. Kept in sync on every status
     # read, so it is a cache of device state rather than a source of truth.
     child_lock = models.BooleanField(default=False)
-    peak_load= models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True,)
-    mean_load = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    peak_load_W = models.FloatField(null=True, blank=True)
+    mean_load_W = models.FloatField(null=True, blank=True)
     cycle_start = models.TimeField(null=True, blank=True)
     cycle_end = models.TimeField(null=True, blank=True)
+    locked_out = models.BooleanField(default=False)
+    lockout_reason = models.CharField(max_length=255, blank=True, default='')
+    locked_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ['organization', 'priority_type', '-priority_degree']
 
+    @property
+    def label(self):
+        """What to call this breaker to a human. The name is optional, so anything
+        user-facing has to be able to fall back to the device id."""
+        return self.name or self.device_id
+
     def __str__(self):
-        return f'{self.device_id} ({self.organization.name})'
+        return f'{self.label} ({self.organization.name})'
 
     @property
     def category_rank(self):
-        """Numeric importance of the category: 3=mandatory, 2=normal, 1=comfort, 0=ac_grid (unitless)."""
+        """Numeric importance: 3=mandatory, 2=normal, 1=comfort, 0=AC grid."""
         return self.CATEGORY_RANK.get(self.priority_type, 0)
+
+
+class BreakerAction(models.Model):
+
+    ACTION_CHOICES = [
+        ('switch_on', 'Switch on'),
+        ('switch_off', 'Switch off'),
+        ('child_lock_on', 'Child lock engaged'),
+        ('child_lock_off', 'Child lock released'),
+        ('countdown_set', 'Countdown scheduled'),
+        ('countdown_cancel', 'Countdown cancelled'),
+    ]
+    SOURCE_CHOICES = [
+        ('manual', 'Manual'),
+        ('kbs', 'Knowledge-based system'),
+    ]
+
+    breaker = models.ForeignKey(Breaker, on_delete=models.CASCADE, related_name='actions')
+    action  = models.CharField(max_length=20, choices=ACTION_CHOICES)
+    source  = models.CharField(max_length=10, choices=SOURCE_CHOICES)
+    reason  = models.TextField(blank=True)
+    actor   = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='breaker_actions',
+    )
+    # Whether the device echoed the change back, not whether Tuya accepted the
+    # request. False means the command was lost and the log disagrees with reality.
+    confirmed = models.BooleanField(null=True)
+
+    # Copied, not referenced: telemetry rows age out under the TimescaleDB retention
+    # policy, and Tuya status is never persisted anywhere else.
+    telemetry      = models.JSONField(null=True, blank=True)
+    breaker_status = models.JSONField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['breaker', '-created_at'])]
+
+    def __str__(self):
+        return f'{self.action} on {self.breaker.device_id} ({self.source})'
 
 
 class BreakerStatus(models.Model):
@@ -88,19 +154,23 @@ class BreakerStatus(models.Model):
         ('last', 'Last'),
     ]
 
-    breaker             = models.OneToOneField(Breaker, on_delete=models.CASCADE, related_name='status') 
-    switch              = models.BooleanField(default=False)                                             
-    countdown_1_s       = models.PositiveIntegerField(default=0)                                         
-    cur_current_mA      = models.FloatField(null=True, blank=True)                                       
-    cur_power_mW        = models.FloatField(null=True, blank=True)                                       
-    cur_voltage_mV      = models.FloatField(null=True, blank=True)                                       
-    fault               = models.CharField(max_length=100, blank=True, default='')                       
-    relay_status        = models.CharField(max_length=20, choices=RELAY_STATUS_CHOICES, default='last')  
-    child_lock          = models.BooleanField(default=False)                                             
-    cycle_time          = models.CharField(max_length=100, blank=True, default='')                       
-    online              = models.BooleanField(default=False)                                             
-    last_switched_on_at = models.DateTimeField(null=True, blank=True)                                    
-    reported_at         = models.DateTimeField(auto_now=True)                                            
+    breaker = models.OneToOneField(
+        Breaker, on_delete=models.CASCADE, related_name='status'
+    )
+    switch = models.BooleanField(default=False)
+    countdown_1_s = models.PositiveIntegerField(default=0)
+    cur_current_mA = models.FloatField(null=True, blank=True)
+    cur_power_mW = models.FloatField(null=True, blank=True)
+    cur_voltage_mV = models.FloatField(null=True, blank=True)
+    fault = models.CharField(max_length=100, blank=True, default='')
+    relay_status = models.CharField(
+        max_length=20, choices=RELAY_STATUS_CHOICES, default='last'
+    )
+    child_lock = models.BooleanField(default=False)
+    cycle_time = models.CharField(max_length=100, blank=True, default='')
+    online = models.BooleanField(default=False)
+    last_switched_on_at = models.DateTimeField(null=True, blank=True)
+    reported_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name_plural = 'breaker statuses'
@@ -111,10 +181,12 @@ class BreakerStatus(models.Model):
 
 class BreakerReading(models.Model):
 
-    breaker      = models.ForeignKey(Breaker, on_delete=models.CASCADE, related_name='readings')  
-    timestamp    = models.DateTimeField()                                                         
-    switch       = models.BooleanField()                                                          
-    cur_power_mW = models.FloatField(null=True, blank=True)                                       
+    breaker = models.ForeignKey(
+        Breaker, on_delete=models.CASCADE, related_name='readings'
+    )
+    timestamp = models.DateTimeField()
+    switch = models.BooleanField()
+    cur_power_mW = models.FloatField(null=True, blank=True)
 
     class Meta:
         ordering = ['-timestamp']

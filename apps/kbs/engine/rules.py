@@ -1,34 +1,4 @@
-"""The decision tree of the main KBS, as a pure function of ``SystemFacts``.
-
-``decide()`` mirrors the project flowchart: every cycle it walks exactly one
-branch and returns the target breaker switches plus any alerts. It touches no
-database and no clock — everything it needs is inside the facts snapshot —
-so every branch is unit-testable with fabricated facts.
-
-Branch codes (returned in ``RuleResult.branch``):
-    protect_inverter.overload         current load exceeds the inverter rating -> shed by priority until it fits
-    protect_battery                   battery near its voltage floor -> countdown shutdown
-    day.surplus.comfort_on            PV covers the loads -> scheduled comfort ON
-    day.battery_stable.comfort_on     battery above threshold -> scheduled comfort ON
-    day.deficit.power_saving          PV short, saving mode -> keep best subset
-    day.deficit.buy_grid              PV short, no saving -> AC-grid breaker ON
-    day.deficit.grid_out.shed         grid tried but delivers nothing -> keep it ON, shed by priority
-    day.sudden_drop.grid_out.shed     same fallback on the sudden-drop path
-    night.sudden_draw.grid_out.shed   same fallback at night
-    day.sudden_drop.battery_ok        sudden PV drop, battery rides it through
-    day.sudden_drop.power_saving      sudden PV drop, saving mode -> best subset
-    day.sudden_drop.buy_grid          sudden PV drop -> AC-grid breaker ON
-    night.calm.battery                quiet night -> run from battery
-    night.sudden_draw.battery_ok      reserve still covers mandatory until morning
-    night.sudden_draw.trip            saving mode -> trip the culprit breaker
-    night.sudden_draw.buy_grid        reserve short -> AC-grid breaker ON
-
-A heatsink over its limit without a live overload, or a joule deficit without
-one, do not get their own branch: they cannot be fixed by shedding (see
-``_protect_inverter_check``), so the cycle falls through to whichever branch
-above actually runs, carrying an ``inverter_protection`` alert if the
-heatsink is the cause.
-"""
+"""Pure Tier-2 decision tree with a deterministic trace for every cycle."""
 
 from dataclasses import dataclass, field
 
@@ -36,109 +6,141 @@ from .derived import graceful_countdown_s
 from .grouping import first_group_within_headroom, select_best_subset
 
 
+TRACE_VERSION = 1
+
+
+def _step(trace, code, kind, outcome, summary, **evidence):
+    trace.append({
+        'code': code, 'kind': kind, 'outcome': outcome,
+        'summary': summary, 'evidence': evidence,
+    })
+
+
+def _guard(trace, code, passed, summary, **evidence):
+    _step(trace, code, 'guard', 'passed' if passed else 'failed', summary, **evidence)
+    return passed
+
+
 @dataclass
 class ActionIntent:
-    """One switch command the engine wants executed."""
-
-    breaker_id: int      # Breaker primary key (unitless)
-    device_id: str       # hardware identifier, for readable logs (unitless)
-    action: str          # target relay state: 'on' | 'off'
-    reason: str          # why the KBS wants this switch (text)
-    lockout: bool = False  # True = also lock the breaker until the user re-enables it (flag)
-    countdown_s: int = 0   # 0 = switch immediately; >0 = arm the device countdown so the switch happens after this delay (s)
+    breaker_id: int
+    device_id: str
+    action: str
+    reason: str
+    lockout: bool = False
+    countdown_s: int = 0
 
 
 @dataclass
 class AlertIntent:
-    """One notification the engine wants raised."""
-
-    kind: str      # Alert.KIND_CHOICES code (text)
-    severity: str  # 'info' | 'warning' | 'critical'
-    message: str   # human-readable description (text)
+    kind: str
+    severity: str
+    message: str
 
 
 @dataclass
 class RuleResult:
-    """Outcome of one decision cycle."""
+    branch: str
+    actions: list = field(default_factory=list)
+    alerts: list = field(default_factory=list)
+    trace_version: int = TRACE_VERSION
+    trace: list = field(default_factory=list)
 
-    branch: str                                  # decision-tree path code (text)
-    actions: list = field(default_factory=list)  # switch commands to execute (list[ActionIntent])
-    alerts: list = field(default_factory=list)   # notifications to raise (list[AlertIntent])
 
-
-def decide(facts):
-    """Walk the decision tree once and return the resulting ``RuleResult``.
-
-    facts: the SystemFacts snapshot gathered for this cycle
-    """
-    # High heatsink temperature or a high cumulative joule deficit both flag
-    # the inverter as stressed, but only a *live* overload (current draw at or
-    # above the rating) can actually be fixed by shedding load: the AC-grid
-    # breaker is the inverter's own input, not a separate feed to the loads,
-    # so every watt in or out already passes through it -- there is no way to
-    # "relieve" it other than reducing what it has to carry.
-    inverter_alert = None  # carried into whichever branch runs below, if any (AlertIntent | None)
-    if facts.heat_high or facts.deficit_high:
-        if facts.overload:
-            # A real overload is the one case that must not share this cycle
-            # with the day/night branch: shedding is the whole response, and
-            # nothing below should try to buy grid power or turn loads back on.
-            return _protect_inverter_overload(facts)
-        if facts.heat_high:
-            # Hot but not overloaded: likely a cooling/hardware fault, not a
-            # load problem. Shedding would not help, so just warn the user and
-            # let the cycle continue normally underneath the alert.
-            inverter_alert = _inverter_heat_alert(facts)
-        # else: joule deficit alone, without a live overload, is a trailing
-        # signal with nothing left to act on this instant -- the battery and
-        # day/night rules below already cover an ongoing energy shortfall.
-
-    # Battery protection comes next: the bank must never reach its voltage
-    # floor, so a graceful countdown shutdown is scheduled while it still can.
-    if facts.battery_low:
-        result = _protect_battery(facts)
-    elif facts.is_daytime:
-        if facts.sudden_pv_drop:
-            result = _daytime_sudden_drop(facts)
-        else:
-            result = _daytime_normal(facts)
-    else:
-        result = _night(facts)
-
-    if inverter_alert is not None:
-        result.alerts.insert(0, inverter_alert)
-
-    # Whatever the branch decided, a running scheduled event gets its required
-    # breakers switched ON (within head-room) — they are treated as mandatory.
-    _ensure_event_required_on(facts, result)
+def _finish(result, trace):
+    _step(
+        trace, f'tier2.branch.{result.branch or "none"}', 'branch', 'selected',
+        f'Selected Tier-2 branch {result.branch or "none"}.', branch=result.branch,
+    )
+    for action in result.actions:
+        _step(
+            trace, 'tier2.output.action', 'output', 'emitted',
+            f'{action.device_id} -> {action.action}.', device_id=action.device_id,
+            action=action.action, countdown_s=action.countdown_s, reason=action.reason,
+        )
+    for alert in result.alerts:
+        _step(trace, 'tier2.output.alert', 'alert', 'emitted', alert.message,
+              alert_kind=alert.kind, severity=alert.severity)
+    result.trace_version = TRACE_VERSION
+    result.trace = trace
     return result
 
 
-# --------------------------------------------------------------------------
-# branches
-# --------------------------------------------------------------------------
+def decide(facts):
+    """Walk one decision path without side effects."""
+    trace = []
+    stressed = facts.heat_high or facts.deficit_high
+    _guard(
+        trace, 'tier2.guard.inverter_stress', stressed,
+        'Checked derived heatsink and cumulative-deficit protection signals.',
+        heat_high=facts.heat_high, deficit_high=facts.deficit_high,
+        heat_actual=facts.heatsink_temp_C, heat_threshold=facts.heatsink_temp_limit_C,
+        heat_unit='C', deficit_actual=facts.joule_deficit_J,
+        deficit_threshold=facts.joule_deficit_limit_J, deficit_unit='J',
+    )
+    inverter_alert = None
+    if stressed:
+        _guard(
+            trace, 'tier2.guard.live_overload', facts.overload,
+            'Checked whether live load is high enough for shedding to help.',
+            actual=facts.load_power_W, operator='>=',
+            threshold=facts.max_inverter_power_W, unit='W',
+        )
+        if facts.overload:
+            return _finish(_protect_inverter_overload(facts, trace), trace)
+        if facts.heat_high:
+            inverter_alert = _inverter_heat_alert(facts)
 
-def _protect_inverter_overload(facts):
-    """Current load genuinely exceeds the inverter's rating: shed by priority
-    until it fits.
+    _guard(
+        trace, 'tier2.guard.battery_low', facts.battery_low,
+        'Checked battery voltage against the non-charging protection threshold.',
+        actual=facts.battery_voltage_V, operator='<=',
+        threshold=facts.battery_low_threshold_V, unit='V',
+    )
+    if facts.battery_low:
+        result = _protect_battery(facts, trace)
+    elif facts.is_daytime:
+        _guard(trace, 'tier2.guard.daytime', True, 'Selected the daytime decision tree.',
+               actual=facts.local_time.isoformat())
+        _guard(
+            trace, 'tier2.guard.sudden_pv_drop', facts.sudden_pv_drop,
+            'Checked current PV against its recent drop threshold.',
+            actual=facts.pv_power_W, baseline=facts.pv_baseline_W,
+            threshold=facts.sudden_drop_fraction, unit='fraction',
+        )
+        result = _daytime_sudden_drop(facts, trace) if facts.sudden_pv_drop else _daytime_normal(facts, trace)
+    else:
+        _guard(trace, 'tier2.guard.daytime', False, 'Selected the nighttime decision tree.',
+               actual=facts.local_time.isoformat())
+        result = _night(facts, trace)
 
-    The AC-grid breaker is deliberately left alone here: it is the inverter's
-    own AC input, not a separate supply line to the loads, so every watt
-    bought from the grid still passes through the same overloaded/overheated
-    unit. Switching it on would add current, not remove it. Shedding stops as
-    soon as the estimated remaining load is within the rating, so a mild
-    overload does not black out the whole site.
-    """
+    if inverter_alert is not None:
+        result.alerts.insert(0, inverter_alert)
+    _ensure_event_required_on(facts, result, trace)
+    return _finish(result, trace)
+
+
+def _protect_inverter_overload(facts, trace):
     result = RuleResult(branch='protect_inverter.overload')
-    remaining_W = facts.load_power_W  # estimated load after the shedding so far (W)
-    for breaker in _shed_order(facts):
-        if remaining_W <= facts.max_inverter_power_W:
+    remaining_W = facts.load_power_W
+    for breaker in _shed_order(facts, trace):
+        within = remaining_W <= facts.max_inverter_power_W
+        _guard(
+            trace, 'tier2.overload.remaining_load', within,
+            'Checked estimated load after priority shedding.', actual=remaining_W,
+            operator='<=', threshold=facts.max_inverter_power_W, unit='W',
+        )
+        if within:
             break
         result.actions.append(ActionIntent(
             breaker_id=breaker.id, device_id=breaker.device_id, action='off',
             reason='emergency shed: inverter overload',
         ))
         remaining_W -= max(breaker.cur_power_W or 0.0, 0.0)
+        _step(trace, 'tier2.overload.breaker', 'breaker_selection', 'included',
+              f'{breaker.device_id} selected for overload shedding.',
+              device_id=breaker.device_id, draw=max(breaker.cur_power_W or 0.0, 0.0),
+              budget=facts.max_inverter_power_W, remaining_capacity=remaining_W, unit='W')
     result.alerts.append(AlertIntent(
         kind='inverter_protection', severity='critical',
         message=(
@@ -151,12 +153,6 @@ def _protect_inverter_overload(facts):
 
 
 def _inverter_heat_alert(facts):
-    """Heatsink over its limit without a live overload.
-
-    Current draw is within the rating, so shedding more load would not cool
-    the unit down -- this points at a cooling or hardware fault instead.
-    Returns the alert only; the caller decides which branch runs underneath it.
-    """
     return AlertIntent(
         kind='inverter_protection', severity='critical',
         message=(
@@ -168,18 +164,16 @@ def _inverter_heat_alert(facts):
     )
 
 
-def _protect_battery(facts):
-    """Battery near its voltage floor: schedule a graceful countdown shutdown.
-
-    Instead of cutting loads instantly, every sheddable running load gets its
-    device countdown armed so it flips OFF after the site has spent at most
-    ``battery_buffer_Wh`` more energy (buffer / current draw). The user is
-    notified which breakers will switch off and when. Without power saving,
-    the AC-grid breaker also goes ON so the grid takes over the load at once.
-    """
+def _protect_battery(facts, trace):
     result = RuleResult(branch='protect_battery')
-    countdown_s = graceful_countdown_s(facts.battery_buffer_Wh, facts.battery_draw_W)  # delay before the scheduled switch-off (s)
-    sheds = _shed_order(facts)  # running sheddable loads, least important first (list[BreakerFacts])
+    countdown_s = graceful_countdown_s(facts.battery_buffer_Wh, facts.battery_draw_W)
+    _step(
+        trace, 'tier2.battery.countdown', 'calculation', 'selected',
+        'Calculated the battery-protection countdown.', budget=facts.battery_buffer_Wh,
+        draw=facts.battery_draw_W, remaining_capacity=countdown_s,
+        budget_unit='Wh', draw_unit='W', result_unit='s',
+    )
+    sheds = _shed_order(facts, trace)
     for breaker in sheds:
         result.actions.append(ActionIntent(
             breaker_id=breaker.id, device_id=breaker.device_id, action='off',
@@ -187,7 +181,7 @@ def _protect_battery(facts):
             countdown_s=countdown_s,
         ))
     if not facts.power_saving:
-        _set_grid(facts, result, on=True, reason='battery near its voltage floor: grid takes over')
+        _set_grid(facts, result, True, 'battery near its voltage floor: grid takes over', trace)
     if sheds:
         message = (
             f'Battery at {facts.battery_voltage_V} V is close to its protection floor. '
@@ -199,276 +193,319 @@ def _protect_battery(facts):
             f'Battery at {facts.battery_voltage_V} V is close to its protection floor and only '
             f'mandatory loads are still running — nothing left to shed.'
         )
-    result.alerts.append(AlertIntent(kind='battery_low', severity='critical', message=message))
+    result.alerts.append(AlertIntent('battery_low', 'critical', message))
     return result
 
 
-def _daytime_normal(facts):
-    """Daytime without a sudden PV drop: enable comfort on schedule if the
-    system can afford it, otherwise fall back to saving mode or the grid."""
-    surplus = facts.pv_power_W > facts.mean_load_on_W  # panels currently out-produce the running loads (flag)
+def _daytime_normal(facts, trace):
+    surplus = facts.pv_power_W > facts.mean_load_on_W
+    _guard(trace, 'tier2.guard.day_surplus', surplus,
+           'Checked whether PV exceeds expected running load.', actual=facts.pv_power_W,
+           operator='>', threshold=facts.mean_load_on_W, unit='W')
+    _guard(trace, 'tier2.guard.battery_stable', facts.battery_stable,
+           'Checked charge state against the active stability threshold.',
+           actual=facts.battery_capacity_percent, operator='>=',
+           threshold=facts.stability_threshold_percent, unit='percent')
     if surplus or facts.battery_stable:
         branch = 'day.surplus.comfort_on' if surplus else 'day.battery_stable.comfort_on'
         result = RuleResult(branch=branch)
-        _turn_on_due_comfort(facts, result)
-        _set_grid(facts, result, on=False, reason='PV/battery cover the loads')
+        _turn_on_due_comfort(facts, result, trace)
+        _set_grid(facts, result, False, 'PV/battery cover the loads', trace)
         return result
+    _guard(trace, 'tier2.guard.power_saving', facts.power_saving,
+           'Checked whether the site forbids grid purchase.', actual=facts.power_saving)
     if facts.power_saving:
         result = RuleResult(branch='day.deficit.power_saving')
-        _keep_best_subset(facts, result, budget_W=facts.pv_power_W)
-        _set_grid(facts, result, on=False, reason='power saving: no grid purchase')
+        _keep_best_subset(facts, result, facts.pv_power_W, trace)
+        _set_grid(facts, result, False, 'power saving: no grid purchase', trace)
         return result
     result = RuleResult(branch='')
-    _buy_grid_or_shed(facts, result, prefix='day.deficit',
-                      reason='PV short and battery below threshold')
+    _buy_grid_or_shed(facts, result, 'day.deficit',
+                      'PV short and battery below threshold', trace)
     return result
 
 
-def _daytime_sudden_drop(facts):
-    """Sudden PV drop during the day: diagnose it (season/weather), then decide
-    based on battery stability and power-saving mode."""
+def _daytime_sudden_drop(facts, trace):
     result = RuleResult(branch='')
     if facts.season == 'summer':
         result.alerts.append(AlertIntent(
-            kind='panel_fault', severity='warning',
-            message=(
-                f'Sudden PV drop in summer ({facts.pv_baseline_W:.0f} W -> '
-                f'{facts.pv_power_W:.0f} W): possible panel fault or shading on the panel.'
-            ),
+            'panel_fault', 'warning',
+            f'Sudden PV drop in summer ({facts.pv_baseline_W:.0f} W -> {facts.pv_power_W:.0f} W): possible panel fault or shading on the panel.',
         ))
     else:
-        condition = facts.weather_condition or 'cloud/storm'  # best explanation available (text)
+        condition = facts.weather_condition or 'cloud/storm'
         result.alerts.append(AlertIntent(
-            kind='weather_drop', severity='info',
-            message=(
-                f'Sudden PV drop in {facts.season} ({facts.pv_baseline_W:.0f} W -> '
-                f'{facts.pv_power_W:.0f} W): most likely weather ({condition}).'
-            ),
+            'weather_drop', 'info',
+            f'Sudden PV drop in {facts.season} ({facts.pv_baseline_W:.0f} W -> {facts.pv_power_W:.0f} W): most likely weather ({condition}).',
         ))
-
+    _guard(trace, 'tier2.guard.sudden_drop.battery_stable', facts.battery_stable,
+           'Checked whether the battery can ride through the PV drop.',
+           actual=facts.battery_capacity_percent, operator='>=',
+           threshold=facts.stability_threshold_percent, unit='percent')
     if facts.battery_stable:
         result.branch = 'day.sudden_drop.battery_ok'
-        _set_grid(facts, result, on=False, reason='battery rides through the PV drop')
+        _set_grid(facts, result, False, 'battery rides through the PV drop', trace)
         return result
+    _guard(trace, 'tier2.guard.sudden_drop.power_saving', facts.power_saving,
+           'Checked whether grid purchase is disabled.', actual=facts.power_saving)
     if facts.power_saving:
         result.branch = 'day.sudden_drop.power_saving'
-        _keep_best_subset(facts, result, budget_W=facts.pv_power_W)
-        _set_grid(facts, result, on=False, reason='power saving: no grid purchase')
+        _keep_best_subset(facts, result, facts.pv_power_W, trace)
+        _set_grid(facts, result, False, 'power saving: no grid purchase', trace)
         return result
-    _buy_grid_or_shed(facts, result, prefix='day.sudden_drop',
-                      reason='PV dropped and battery below threshold')
+    _buy_grid_or_shed(facts, result, 'day.sudden_drop',
+                      'PV dropped and battery below threshold', trace)
     return result
 
 
-def _night(facts):
-    """Night: run from battery; on a sudden draw make sure the mandatory loads
-    (servers, ...) still reach the morning."""
+def _night(facts, trace):
+    _guard(trace, 'tier2.guard.sudden_draw', facts.sudden_draw,
+           'Checked load against the configured sudden-draw threshold.',
+           actual=facts.load_power_W, baseline=facts.load_baseline_W,
+           threshold=facts.sudden_draw_W, unit='W')
     if not facts.sudden_draw:
         result = RuleResult(branch='night.calm.battery')
-        if facts.battery_remaining_Wh >= facts.mandatory_need_Wh:
-            # Enough energy and no unusual draw -> grid power is not needed.
-            _set_grid(facts, result, on=False, reason='night: battery covers the reserve, grid not needed')
-        # else: leave the grid breaker as it is — if it is ON and delivering,
-        # it keeps relieving the battery until the reserve is safe again.
+        enough = facts.battery_remaining_Wh >= facts.mandatory_need_Wh
+        _guard(trace, 'tier2.guard.night_reserve', enough,
+               'Checked battery energy against mandatory need until morning.',
+               actual=facts.battery_remaining_Wh, operator='>=',
+               threshold=facts.mandatory_need_Wh, unit='Wh')
+        if enough:
+            _set_grid(facts, result, False,
+                      'night: battery covers the reserve, grid not needed', trace)
+        else:
+            _step(trace, 'tier2.grid.preserve', 'noop', 'noop',
+                  'Reserve is short; preserved the current grid breaker state.')
         return result
-
-    if facts.battery_remaining_Wh >= facts.mandatory_need_Wh:
+    enough = facts.battery_remaining_Wh >= facts.mandatory_need_Wh
+    _guard(trace, 'tier2.guard.night_reserve', enough,
+           'Checked remaining battery energy against mandatory need until morning.',
+           actual=facts.battery_remaining_Wh, operator='>=',
+           threshold=facts.mandatory_need_Wh, unit='Wh')
+    if enough:
         result = RuleResult(branch='night.sudden_draw.battery_ok')
-        _set_grid(facts, result, on=False, reason='reserve still covers mandatory loads until morning')
+        _set_grid(facts, result, False,
+                  'reserve still covers mandatory loads until morning', trace)
         return result
-
-    culprit = _culprit(facts)  # breaker behind the sudden draw, if identifiable (BreakerFacts | None)
+    culprit = _culprit(facts)
     can_trip = (
-        facts.power_saving
-        and culprit is not None
-        and culprit.priority_type in ('normal', 'comfort')
-        and not culprit.recently_tripped  # user re-enabled it tonight -> respect that, buy grid instead
-    )  # flag
+        facts.power_saving and culprit is not None
+        and culprit.priority_type in ('normal', 'comfort') and not culprit.recently_tripped
+    )
+    _guard(trace, 'tier2.guard.trip_culprit', can_trip,
+           'Checked whether the sudden-draw culprit may be tripped.',
+           power_saving=facts.power_saving, culprit=culprit.device_id if culprit else None,
+           recently_tripped=culprit.recently_tripped if culprit else None)
     if can_trip:
         result = RuleResult(branch='night.sudden_draw.trip')
         result.actions.append(ActionIntent(
-            breaker_id=culprit.id, device_id=culprit.device_id, action='off',
-            reason='night sudden draw endangers the morning reserve', lockout=True,
+            culprit.id, culprit.device_id, 'off',
+            'night sudden draw endangers the morning reserve', lockout=True,
         ))
         result.alerts.append(AlertIntent(
-            kind='night_trip', severity='warning',
-            message=(
-                f'Breaker {culprit.device_id} tripped: its sudden draw endangers the '
-                f'mandatory night reserve. Re-enable it manually to override.'
-            ),
+            'night_trip', 'warning',
+            f'Breaker {culprit.device_id} tripped: its sudden draw endangers the mandatory night reserve. Re-enable it manually to override.',
         ))
-        _set_grid(facts, result, on=False, reason='power saving: culprit tripped instead of buying grid')
+        _set_grid(facts, result, False,
+                  'power saving: culprit tripped instead of buying grid', trace)
         return result
-
     result = RuleResult(branch='')
-    _buy_grid_or_shed(facts, result, prefix='night.sudden_draw',
-                      reason='night reserve short for mandatory loads until morning')
+    _buy_grid_or_shed(facts, result, 'night.sudden_draw',
+                      'night reserve short for mandatory loads until morning', trace)
     return result
 
 
-# --------------------------------------------------------------------------
-# helpers
-# --------------------------------------------------------------------------
-
-def _shed_order(facts):
-    """Currently-ON sheddable loads, least important first (list[BreakerFacts]).
-
-    Loads outside their user-configured usage window come first (the user is
-    not using them right now anyway), then comfort before normal, and inside
-    a category the lowest priority degree first. Mandatory, the AC-grid
-    breaker, and event-required loads are never listed.
-    """
-    return sorted(
-        [
-            b for b in facts.breakers
-            if b.switch and b.priority_type in ('comfort', 'normal') and not b.event_required
-        ],
+def _shed_order(facts, trace):
+    candidates = []
+    for breaker in facts.breakers:
+        included = (
+            breaker.switch and breaker.priority_type in ('comfort', 'normal')
+            and not breaker.event_required
+        )
+        _step(trace, 'tier2.shed.eligibility', 'breaker_selection',
+              'included' if included else 'excluded',
+              f'{breaker.device_id} is {"eligible" if included else "not eligible"} for shedding.',
+              device_id=breaker.device_id, switch=breaker.switch,
+              priority_type=breaker.priority_type, priority_degree=breaker.priority_degree,
+              event_required=breaker.event_required,
+              protected=breaker.priority_type == 'mandatory' or breaker.event_required)
+        if included:
+            candidates.append(breaker)
+    ordered = sorted(
+        candidates,
         key=lambda b: (b.in_usage_window(facts.local_time), b.category_rank, b.priority_degree),
     )
+    _step(trace, 'tier2.shed.ranking', 'breaker_ranking', 'selected',
+          'Eligible breakers ranked for shedding.',
+          candidates=[b.device_id for b in candidates], ranked=[b.device_id for b in ordered],
+          ranking=['outside_usage_window_first', 'category_rank_ascending', 'priority_degree_ascending'])
+    return ordered
 
 
-def _turn_on_due_comfort(facts, result):
-    """Switch ON the comfort breakers whose schedule window contains now,
-    limited to what the inverter head-room tolerates this cycle.
-
-    Motor loads enter through their peak draw, so only the first group fits
-    now; the remaining ones follow on the next cycles once earlier loads
-    settle — this produces the staggered start.
-    """
-    due = []  # comfort breakers that should be ON now and can be commanded (list[BreakerFacts])
-    for b in facts.breakers:
-        if b.priority_type != 'comfort' or b.switch or b.locked_out:
+def _turn_on_due_comfort(facts, result, trace):
+    due = []
+    for breaker in facts.breakers:
+        if breaker.priority_type != 'comfort' or breaker.switch or breaker.locked_out:
+            _step(trace, 'tier2.comfort.eligibility', 'breaker_selection', 'excluded',
+                  f'{breaker.device_id} is not an OFF, unlocked comfort candidate.',
+                  device_id=breaker.device_id, priority_type=breaker.priority_type,
+                  switch=breaker.switch, locked_out=breaker.locked_out)
             continue
-        if not b.in_schedule_window(facts.local_time):
+        if not breaker.in_schedule_window(facts.local_time):
+            _step(trace, 'tier2.comfort.schedule', 'breaker_selection', 'excluded',
+                  f'{breaker.device_id} is outside its comfort schedule.',
+                  device_id=breaker.device_id, actual=facts.local_time.isoformat(),
+                  operator='in_window', threshold=[str(breaker.cycle_start), str(breaker.cycle_end)])
             continue
-        if not b.healthy:
+        if not breaker.healthy:
+            _step(trace, 'tier2.comfort.health', 'breaker_selection', 'excluded',
+                  f'{breaker.device_id} cannot be switched on because it is unhealthy.',
+                  device_id=breaker.device_id, online=breaker.online, fault=breaker.fault)
             result.alerts.append(AlertIntent(
-                kind='breaker_fault', severity='warning',
-                message=(
-                    f'Comfort breaker {b.device_id} is due ON but '
-                    f'{"faulted: " + b.fault if b.fault else "offline"}.'
-                ),
+                'breaker_fault', 'warning',
+                f'Comfort breaker {breaker.device_id} is due ON but '
+                f'{"faulted: " + breaker.fault if breaker.fault else "offline"}.',
             ))
             continue
-        due.append(b)
-    for b in first_group_within_headroom(due, facts.headroom_W, facts.motor_peak_minutes):
+        due.append(breaker)
+    selected = first_group_within_headroom(due, facts.headroom_W, facts.motor_peak_minutes)
+    selected_ids = {breaker.id for breaker in selected}
+    remaining_W = facts.headroom_W
+    for breaker in sorted(due, key=lambda b: (-b.category_rank, -b.priority_degree)):
+        draw_W = breaker.expected_draw_W(facts.motor_peak_minutes)
+        included = breaker.id in selected_ids
+        _step(trace, 'tier2.comfort.headroom', 'breaker_selection',
+              'included' if included else 'excluded',
+              f'{breaker.device_id} {"was selected for" if included else "was deferred from"} '
+              'the current startup group.',
+              device_id=breaker.device_id, draw=draw_W, unit='W',
+              budget=facts.headroom_W, remaining_capacity=remaining_W)
+        if included:
+            remaining_W -= draw_W
+    for breaker in selected:
         result.actions.append(ActionIntent(
-            breaker_id=b.id, device_id=b.device_id, action='on',
-            reason='comfort schedule window and the system affords it',
+            breaker.id, breaker.device_id, 'on',
+            'comfort schedule window and the system affords it',
         ))
 
 
-def _keep_best_subset(facts, result, budget_W):
-    """Power-saving: keep the most important possible set of running loads
-    within ``budget_W`` and shed the rest (instead of buying grid power).
-
-    budget_W: power the system can sustainably supply right now, e.g. current
-              PV production (W). Mandatory loads are served first off-budget —
-              they are never shed — and only the remainder is auctioned among
-              the normal/comfort loads.
-    """
+def _keep_best_subset(facts, result, budget_W, trace):
     mandatory_draw_W = sum(
-        b.expected_draw_W(facts.motor_peak_minutes)
-        for b in facts.breakers
-        if b.switch and (b.priority_type == 'mandatory' or b.event_required)
-    )  # power the mandatory (and event-required) loads consume right now (W)
-    sheddable = _shed_order(facts)  # running normal/comfort loads (list[BreakerFacts])
-    keep = select_best_subset(
-        sheddable,
-        max(budget_W - mandatory_draw_W, 0.0),
-        facts.motor_peak_minutes,
-    )  # loads that stay ON (list[BreakerFacts])
-    keep_ids = {b.id for b in keep}  # ids of the kept loads (set)
-    for b in sheddable:
-        if b.id not in keep_ids:
+        breaker.expected_draw_W(facts.motor_peak_minutes)
+        for breaker in facts.breakers
+        if breaker.switch and (breaker.priority_type == 'mandatory' or breaker.event_required)
+    )
+    affordable_W = max(budget_W - mandatory_draw_W, 0.0)
+    _step(trace, 'tier2.subset.budget', 'budget', 'selected',
+          'Reserved supply for mandatory and event-required loads.', budget=budget_W,
+          mandatory_draw=mandatory_draw_W, unit='W', remaining_capacity=affordable_W)
+    sheddable = _shed_order(facts, trace)
+    keep = select_best_subset(sheddable, affordable_W, facts.motor_peak_minutes)
+    keep_ids = {breaker.id for breaker in keep}
+    for breaker in sheddable:
+        included = breaker.id in keep_ids
+        _step(trace, 'tier2.subset.selection', 'breaker_selection',
+              'included' if included else 'excluded',
+              f'{breaker.device_id} is {"inside" if included else "outside"} the affordable subset.',
+              device_id=breaker.device_id,
+              draw=breaker.expected_draw_W(facts.motor_peak_minutes), budget=affordable_W, unit='W')
+        if not included:
             result.actions.append(ActionIntent(
-                breaker_id=b.id, device_id=b.device_id, action='off',
-                reason='power saving: outside the affordable subset',
+                breaker.id, breaker.device_id, 'off',
+                'power saving: outside the affordable subset',
             ))
 
 
-def _ensure_event_required_on(facts, result):
-    """Switch ON the breakers a currently running event needs, within head-room.
-
-    Event-required breakers are treated like mandatory loads for the whole
-    event window: they are excluded from every shedding list, and here they
-    are brought ON if anything switched them off before the event started.
-    """
-    candidates = []  # event-required breakers that are OFF and can be commanded (list[BreakerFacts])
-    already_commanded = {a.breaker_id for a in result.actions}  # breakers this cycle already targets (set of pks)
-    for b in facts.breakers:
-        if not b.event_required or b.switch or b.locked_out or b.id in already_commanded:
+def _ensure_event_required_on(facts, result, trace):
+    candidates = []
+    already_commanded = {action.breaker_id for action in result.actions}
+    for breaker in facts.breakers:
+        if not breaker.event_required:
             continue
-        if not b.healthy:
+        if breaker.switch or breaker.locked_out or breaker.id in already_commanded:
+            _step(trace, 'tier2.event_required.eligibility', 'breaker_selection', 'excluded',
+                  f'{breaker.device_id} needs no new event override command.',
+                  device_id=breaker.device_id, switch=breaker.switch,
+                  locked_out=breaker.locked_out,
+                  already_commanded=breaker.id in already_commanded, protected=True)
+            continue
+        if not breaker.healthy:
+            _step(trace, 'tier2.event_required.health', 'breaker_selection', 'excluded',
+                  f'{breaker.device_id} is event-required but unhealthy.',
+                  device_id=breaker.device_id, online=breaker.online,
+                  fault=breaker.fault, protected=True)
             result.alerts.append(AlertIntent(
-                kind='breaker_fault', severity='warning',
-                message=(
-                    f'Breaker {b.device_id} is required by a scheduled event but '
-                    f'{"faulted: " + b.fault if b.fault else "offline"}.'
-                ),
+                'breaker_fault', 'warning',
+                f'Breaker {breaker.device_id} is required by a scheduled event but '
+                f'{"faulted: " + breaker.fault if breaker.fault else "offline"}.',
             ))
             continue
-        candidates.append(b)
-    for b in first_group_within_headroom(candidates, facts.headroom_W, facts.motor_peak_minutes):
+        candidates.append(breaker)
+    selected = first_group_within_headroom(candidates, facts.headroom_W, facts.motor_peak_minutes)
+    selected_ids = {breaker.id for breaker in selected}
+    for breaker in candidates:
+        included = breaker.id in selected_ids
+        _step(trace, 'tier2.event_required.headroom', 'breaker_selection',
+              'included' if included else 'excluded',
+              f'{breaker.device_id} {"was selected for" if included else "was deferred from"} '
+              'the current event startup group.',
+              device_id=breaker.device_id,
+              draw=breaker.expected_draw_W(facts.motor_peak_minutes),
+              budget=facts.headroom_W, unit='W', protected=True)
+    for breaker in selected:
         result.actions.append(ActionIntent(
-            breaker_id=b.id, device_id=b.device_id, action='on',
-            reason='required by the running scheduled event',
+            breaker.id, breaker.device_id, 'on',
+            'required by the running scheduled event',
         ))
 
 
-def _buy_grid_or_shed(facts, result, prefix, reason):
-    """Buy grid electricity — with the real-world fallback when the grid is out.
-
-    Cycle-based sensing: the first cycle switches the AC-grid breaker ON; on
-    the next cycle the inverter's grid voltage shows whether the state grid is
-    actually delivering. If it is not (``grid_failed``), the breaker stays ON
-    (supply resumes by itself the moment the grid returns) and — even without
-    power-saving mode — comfort/normal loads are shed by priority, because
-    waiting for a dead grid would just drain the battery.
-
-    prefix: branch-code prefix of the calling path, e.g. 'day.deficit' (text)
-    reason: why grid power is wanted (text)
-    """
+def _buy_grid_or_shed(facts, result, prefix, reason, trace):
+    _guard(trace, 'tier2.guard.grid_failed', facts.grid_failed,
+           'Checked whether the closed grid path is delivering voltage.',
+           grid_breaker_on=facts.grid_breaker_on, grid_energized=facts.grid_energized,
+           operator='>=', threshold=facts.grid_present_min_V, unit='V')
     if facts.grid_failed:
         result.branch = f'{prefix}.grid_out.shed'
-        _keep_best_subset(facts, result, budget_W=facts.pv_power_W)
+        _keep_best_subset(facts, result, facts.pv_power_W, trace)
         result.alerts.append(AlertIntent(
-            kind='grid_outage', severity='critical',
-            message=(
-                'AC-grid breaker is ON but the grid delivers no power. '
-                'Shedding comfort/normal loads by priority until the grid returns.'
-            ),
+            'grid_outage', 'critical',
+            'AC-grid breaker is ON but the grid delivers no power. Shedding comfort/normal loads by priority until the grid returns.',
         ))
         return
     result.branch = f'{prefix}.buy_grid'
-    _set_grid(facts, result, on=True, reason=reason)
+    _set_grid(facts, result, True, reason, trace)
 
 
 def _culprit(facts):
-    """The BreakerFacts of the sudden-draw culprit, or None when unknown."""
     if facts.sudden_draw_culprit_id is None:
         return None
     return next((b for b in facts.breakers if b.id == facts.sudden_draw_culprit_id), None)
 
 
-def _set_grid(facts, result, on, reason):
-    """Command the AC-grid breaker to the wanted state, if it exists and differs.
-
-    on:     True = buy grid electricity, False = stop buying (flag)
-    reason: why the grid state was chosen (text)
-    """
-    grid = next((b for b in facts.breakers if b.priority_type == 'ac_grid'), None)  # the site's AC-grid breaker (BreakerFacts | None)
-    if grid is None or grid.switch == on:
+def _set_grid(facts, result, on, reason, trace):
+    grid = next((b for b in facts.breakers if b.priority_type == 'ac_grid'), None)
+    if grid is None:
+        _step(trace, 'tier2.grid.noop', 'noop', 'noop',
+              'No AC-grid breaker is configured.', requested_state=on)
+        return
+    if grid.switch == on:
+        _step(trace, 'tier2.grid.noop', 'noop', 'noop',
+              'AC-grid breaker is already in the requested state.',
+              device_id=grid.device_id, requested_state=on, actual_state=grid.switch)
         return
     if on and not grid.healthy:
+        _step(trace, 'tier2.grid.health', 'breaker_selection', 'excluded',
+              'AC-grid command cannot be emitted because the breaker is unhealthy.',
+              device_id=grid.device_id, online=grid.online, fault=grid.fault)
         result.alerts.append(AlertIntent(
-            kind='breaker_fault', severity='critical',
-            message=(
-                f'AC-grid breaker {grid.device_id} needed ON but '
-                f'{"faulted: " + grid.fault if grid.fault else "offline"}.'
-            ),
+            'breaker_fault', 'critical',
+            f'AC-grid breaker {grid.device_id} needed ON but '
+            f'{"faulted: " + grid.fault if grid.fault else "offline"}.',
         ))
+        return
+    _step(trace, 'tier2.grid.command', 'breaker_selection', 'included',
+          'AC-grid breaker selected for a state change.', device_id=grid.device_id,
+          actual_state=grid.switch, requested_state=on)
     result.actions.append(ActionIntent(
-        breaker_id=grid.id, device_id=grid.device_id,
-        action='on' if on else 'off', reason=reason,
+        grid.id, grid.device_id, 'on' if on else 'off', reason,
     ))

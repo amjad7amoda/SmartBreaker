@@ -1,7 +1,7 @@
 from django import forms
 from django.contrib import admin
 
-from .models import Breaker, TuyaCredential
+from .models import Breaker, BreakerReading, BreakerStatus, TuyaCredential
 
 
 class TuyaCredentialForm(forms.ModelForm):
@@ -41,12 +41,14 @@ class TuyaCredentialAdmin(admin.ModelAdmin):
 @admin.register(Breaker)
 class BreakerAdmin(admin.ModelAdmin):
     list_display = (
-        'device_id', 'organization', 'priority_type', 'priority_degree',
+        'name', 'device_id', 'organization', 'priority_type', 'priority_degree',
         'load_type', 'peak_load_W', 'mean_load_W',
         'cycle_start', 'cycle_end', 'locked_out',
     )
-    list_filter = ('priority_type', 'load_type', 'locked_out', 'organization')
-    search_fields = ('device_id', 'organization__name')
+    list_filter = (
+        'priority_type', 'load_type', 'locked_out', 'child_lock', 'organization',
+    )
+    search_fields = ('name', 'device_id', 'organization__name')
     readonly_fields = ('created_at',)
 
 

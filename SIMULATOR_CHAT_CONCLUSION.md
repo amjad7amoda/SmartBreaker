@@ -414,4 +414,3 @@ This creates a clear separation of concerns:
 - **Python facts and rules decide.**
 - **Scenario definitions produce repeatable physical conditions.**
 - **The browser executes and explains the result.**
-

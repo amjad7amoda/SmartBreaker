@@ -1,0 +1,11 @@
+venv/
+.git/
+.gitignore
+.idea/
+.claude/
+**/__pycache__/
+*.py[cod]
+*.sqlite3
+.env
+README.md
+arch.md

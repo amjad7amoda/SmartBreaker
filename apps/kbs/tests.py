@@ -1,23 +1,15 @@
-"""Unit tests for the KBS knowledge base.
+"""Pure unit tests for the dataclass KBS described in KBS_FACTS_AND_RULES.md."""
 
-``decide()`` runs the Experta rules over a fabricated snapshot, so every
-flowchart branch is exercised here without a database, a clock or a network.
-"""
-
+from dataclasses import FrozenInstanceError
 from datetime import datetime, time, timezone as dt_timezone
-
-from django.test import SimpleTestCase
-
-from apps.breakers.models import Breaker
+from unittest import TestCase
 
 from .engine.derived import (
-    expected_draw_W,
     graceful_countdown_s,
-    in_window,
     is_daytime,
     ramped_threshold,
 )
-from .engine.facts import SHEDDABLE_TYPES, BreakerFact, SystemFact
+from .engine.facts import BreakerFacts, SystemFacts
 from .engine.rules import decide
 
 UTC = dt_timezone.utc
@@ -26,13 +18,7 @@ MOTOR_PEAK_MINUTES = 20  # motor inrush duration assumed in the fixtures (min)
 
 
 def make_breaker(local_time=NOON, **overrides):
-    """A BreakerFact with sensible defaults, overridable per test.
-
-    The fields ``gathering.py`` would derive (draw, rank, health, windows) are
-    computed here the same way, so a test only states what it cares about.
-
-    local_time: clock the schedule/usage windows are evaluated against (local clock time)
-    """
+    """A BreakerFacts value with sensible defaults, overridable per test."""
     values = dict(
         id=1, device_id='b1',
         priority_type='normal',  # importance category
@@ -52,26 +38,13 @@ def make_breaker(local_time=NOON, **overrides):
         minutes_since_on=60.0,   # long past any motor peak (min)
     )
     values.update(overrides)
-    windowed = values['cycle_start'] is not None and values['cycle_end'] is not None  # has a configured window (flag)
-    in_schedule = in_window(local_time, values['cycle_start'], values['cycle_end'])   # clock inside that window (flag)
-    for key, derived in (
-        ('category_rank', Breaker.CATEGORY_RANK.get(values['priority_type'], 0)),
-        ('expected_draw_W', expected_draw_W(
-            values['load_type'], values['minutes_since_on'], MOTOR_PEAK_MINUTES,
-            values['peak_load_W'], values['mean_load_W'], values['cur_power_W'])),
-        ('healthy', values['online'] and not values['fault']),
-        ('in_schedule_window', in_schedule),
-        ('in_usage_window', in_schedule if windowed else True),
-        ('sheddable', values['priority_type'] in SHEDDABLE_TYPES and not values['event_required']),
-    ):
-        values.setdefault(key, derived)
-    return BreakerFact(**values)
+    return BreakerFacts(**values)
 
 
 def make_facts(breakers, **overrides):
     """A whole snapshot of a healthy summer noon, overridable per test.
 
-    returns: the fact list ``decide()`` expects (list[Fact])
+    returns: the immutable SystemFacts value accepted by decide()
     """
     values = dict(
         organization_id=1,
@@ -113,7 +86,7 @@ def make_facts(breakers, **overrides):
         motor_peak_minutes=MOTOR_PEAK_MINUTES,
     )
     values.update(overrides)
-    return [SystemFact(**values), *breakers]
+    return SystemFacts(**values, breakers=tuple(breakers))
 
 
 def actions_by_device(result):
@@ -126,15 +99,18 @@ def alert_kinds(result):
     return [a.kind for a in result.alerts]
 
 
-class KnowledgeBaseTests(SimpleTestCase):
-    """The Experta mechanics the whole decision tree rests on."""
+class KnowledgeBaseTests(TestCase):
+    """Decision-tree precedence and cross-cutting behavior."""
 
     def test_only_one_branch_is_taken_when_several_match(self):
-        # heat, a low battery and a comfortable daytime surplus all match at
-        # once; salience + the DecisionFact guard must leave only the first.
+        # Heat without a live overload alerts and falls through; battery
+        # protection is therefore the one selected branch.
         result = decide(make_facts([], heat_high=True, battery_low=True))
-        self.assertEqual(result.branch, 'protect_inverter')
-        self.assertEqual(alert_kinds(result), ['inverter_protection'])
+        self.assertEqual(result.branch, 'protect_battery')
+        self.assertEqual(
+            alert_kinds(result),
+            ['inverter_protection', 'battery_low'],
+        )
 
     def test_battery_protection_outranks_the_daytime_branches(self):
         result = decide(make_facts([], battery_low=True))
@@ -178,12 +154,34 @@ class KnowledgeBaseTests(SimpleTestCase):
         self.assertEqual(alert_kinds(result), ['breaker_fault'])
         self.assertIn('overcurrent', result.alerts[0].message)
 
-    def test_facts_are_validated_on_declaration(self):
-        with self.assertRaises(ValueError):
-            decide(make_facts([], pv_power_W='a lot'))  # wrong type must fail loudly
+    def test_unavailable_grid_breaker_is_reported_not_commanded(self):
+        breakers = [
+            make_breaker(
+                id=1,
+                device_id='grid',
+                priority_type='ac_grid',
+                switch=False,
+                online=False,
+            ),
+        ]
+        result = decide(make_facts(
+            breakers,
+            pv_power_W=100.0,
+            mean_load_on_W=1000.0,
+            battery_stable=False,
+        ))
+        self.assertEqual(result.branch, 'day.deficit.buy_grid')
+        self.assertEqual(result.actions, [])
+        self.assertEqual(alert_kinds(result), ['breaker_fault'])
+        self.assertIn('offline', result.alerts[0].message)
+
+    def test_facts_are_immutable(self):
+        facts = make_facts([])
+        with self.assertRaises(FrozenInstanceError):
+            facts.pv_power_W = 1.0
 
 
-class ProtectInverterTests(SimpleTestCase):
+class ProtectInverterTests(TestCase):
 
     def test_overload_sheds_comfort_then_normal_never_mandatory(self):
         breakers = [
@@ -241,7 +239,7 @@ class ProtectInverterTests(SimpleTestCase):
         self.assertEqual(off_devices, ['idle', 'inuse'])
 
 
-class BatteryProtectionTests(SimpleTestCase):
+class BatteryProtectionTests(TestCase):
 
     def low_battery_facts(self, breakers, **overrides):
         values = dict(
@@ -282,7 +280,7 @@ class BatteryProtectionTests(SimpleTestCase):
         self.assertEqual(actions_by_device(result)['tv'].countdown_s, 300)
 
 
-class ScheduledEventTests(SimpleTestCase):
+class ScheduledEventTests(TestCase):
 
     def test_event_required_breaker_is_never_shed(self):
         breakers = [
@@ -319,7 +317,7 @@ class ScheduledEventTests(SimpleTestCase):
         self.assertNotIn('projector', by_device)
 
 
-class GridOutageTests(SimpleTestCase):
+class GridOutageTests(TestCase):
 
     def test_day_deficit_with_dead_grid_sheds_even_without_saving(self):
         breakers = [
@@ -392,7 +390,7 @@ class GridOutageTests(SimpleTestCase):
         self.assertEqual(actions_by_device(result)['grid'].action, 'off')
 
 
-class DerivedTests(SimpleTestCase):
+class DerivedTests(TestCase):
 
     def test_ramped_threshold_interpolates_over_prep_window(self):
         self.assertEqual(ramped_threshold(50.0, 80.0, None, 24.0), 50.0)   # no event
@@ -412,7 +410,7 @@ class DerivedTests(SimpleTestCase):
         self.assertFalse(is_daytime(time(23, 0), day_start, day_end, 0.0, 10.0))   # night
 
 
-class DaytimeTests(SimpleTestCase):
+class DaytimeTests(TestCase):
 
     def test_surplus_turns_on_scheduled_comfort_within_headroom(self):
         breakers = [
@@ -469,7 +467,7 @@ class DaytimeTests(SimpleTestCase):
         self.assertNotIn('server', by_device)   # mandatory never shed
 
 
-class SuddenDropTests(SimpleTestCase):
+class SuddenDropTests(TestCase):
 
     def test_summer_drop_raises_panel_fault_alert(self):
         result = decide(make_facts(
@@ -510,7 +508,7 @@ class SuddenDropTests(SimpleTestCase):
         self.assertEqual(actions_by_device(result)['tv'].action, 'off')
 
 
-class NightTests(SimpleTestCase):
+class NightTests(TestCase):
 
     def night_facts(self, breakers, **overrides):
         values = dict(

@@ -24,6 +24,8 @@ apps/kbs/                Tier-2 engine, Django adapter, audit API and action exe
 edge/                    Tier-1 safety engine, audit spool and backend bridge
 simulator/               Browser simulator and real-world scenario data
 docker-compose.yml       Local Redis and Postgres
+Dockerfile               App image (web, worker, beat all run from it)
+docker-compose.yml       Full local stack: postgres, redis, web, worker, beat
 requirements.txt         Python dependencies
 manage.py
 ```
@@ -31,7 +33,42 @@ manage.py
 Settings are split under `config/settings/`: `base.py` (shared), `development.py`,
 `production.py`. `manage.py` and `celery.py` default to `config.settings.development`.
 
-## Local setup
+## Local setup with Docker (recommended)
+
+Everything — Postgres, Redis, the Django dev server, the Celery worker and beat —
+runs as containers. You only need Docker Desktop and a filled-in `.env`.
+
+```bash
+docker compose up --build      # -d to detach
+```
+
+That starts, in order: `db` and `redis` (waited on via healthchecks), a one-shot
+`migrate` service, then `web`, `worker` and `beat`. The API is on
+http://localhost:8000.
+
+The `DB_HOST`, `DB_PORT` and `CELERY_*` values in `.env` are overridden in
+`docker-compose.yml` so the containers reach `db` and `redis` instead of
+`localhost` — everything else (`SECRET_KEY`, `EMAIL_*`, `TUYA_FERNET_KEY`) is read
+from `.env` as usual. `DB_NAME`/`DB_USER`/`DB_PASSWORD` also seed the Postgres
+container, so they must be set before the first `up`.
+
+Postgres is published on host port **5433**, not 5432, to avoid clashing with a
+natively installed Postgres. Inside the compose network it's still `db:5432`.
+
+Common commands:
+
+```bash
+docker compose exec web python manage.py createsuperuser
+docker compose exec web python manage.py test apps.accounts.tests apps.organizations.tests
+docker compose logs -f worker
+docker compose down            # add -v to also wipe the database volume
+```
+
+The project directory is bind-mounted into the containers, so edits reload the dev
+server without a rebuild. Rebuild only when `requirements.txt` changes:
+`docker compose up -d --build`.
+
+## Local setup without Docker
 
 1. **Install dependencies**
    ```bash

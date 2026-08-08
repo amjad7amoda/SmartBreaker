@@ -12,3 +12,6 @@ channels
 channels-redis
 daphne
 python-dotenv
+# Not on PyPI — pip cannot resolve it, which breaks `pip install -r requirements.txt`
+# everywhere (Docker build included). Only api/index.py needs it, for Vercel.
+# vercel-wsgi

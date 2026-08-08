@@ -14,7 +14,7 @@ from apps.telemetry.models import Reading
 
 from .climate import ClimateDataError, load_climate_rows
 from .models import (
-    Alert, BreakerAction, KBSDecision, KBSSettings, ScheduledEvent,
+    Alert, BreakerAction, KBSControllerState, KBSDecision, KBSSettings, ScheduledEvent,
     Tier1SafetyState,
 )
 
@@ -123,6 +123,10 @@ class SimulatorApiTests(APITestCase):
         self.assertEqual(body['latest_telemetry']['pv_charging_power_W'], 1500)
         self.assertEqual(body['metadata']['engine'], 'apps.kbs.services.run_cycle')
         self.assertEqual(body['settings']['max_inverter_power_W'], 5000)
+        self.assertEqual(body['settings']['tier2_policy'], 'crisp')
+        self.assertEqual(body['policy'], 'crisp')
+        self.assertEqual(body['metadata']['fuzzy_profile'], 'mamdani-v1')
+        self.assertEqual(body['controller_state']['current_band'], 'watch')
         self.assertFalse(body['tier1_safety']['active'])
         self.assertEqual(body['breakers'][0]['device_id'], 'sim-api-load')
         self.assertTrue(body['breakers'][0]['locked_out'])
@@ -142,6 +146,9 @@ class SimulatorApiTests(APITestCase):
             situation='inverter_overheat',
             commands=[],
         )
+        KBSControllerState.objects.create(
+            organization=self.sim_org, current_band='high',
+        )
         response = self.client.post(
             '/api/kbs/sim/reset/', {'organization': self.sim_org.id, 'confirm': True}, format='json',
         )
@@ -151,6 +158,9 @@ class SimulatorApiTests(APITestCase):
         self.assertFalse(KBSDecision.objects.filter(organization=self.sim_org).exists())
         self.assertFalse(Alert.objects.filter(organization=self.sim_org).exists())
         self.assertFalse(Tier1SafetyState.objects.filter(
+            organization=self.sim_org,
+        ).exists())
+        self.assertFalse(KBSControllerState.objects.filter(
             organization=self.sim_org,
         ).exists())
         self.assertTrue(Reading.objects.filter(organization=self.other_org).exists())
@@ -164,6 +174,31 @@ class SimulatorApiTests(APITestCase):
         self.assertFalse(self.breaker.child_lock)
         self.assertEqual(status_row.countdown_1_s, 0)
         self.assertFalse(status_row.child_lock)
+
+    def test_policy_setting_validates_and_synchronizes(self):
+        response = self.client.patch(
+            '/api/kbs/settings/?organization=' + str(self.sim_org.id),
+            {
+                'tier2_policy': 'fuzzy_shadow',
+                'battery_capacity_Wh': 7200,
+                'night_reserve_percent': 35,
+                'max_inverter_power_W': 4400,
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['updated']['tier2_policy'], 'fuzzy_shadow')
+        settings = KBSSettings.objects.get(organization=self.sim_org)
+        self.assertEqual(settings.tier2_policy, 'fuzzy_shadow')
+        self.assertEqual(settings.battery_capacity_Wh, 7200)
+        self.assertEqual(settings.night_reserve_percent, 35)
+        self.assertEqual(settings.max_inverter_power_W, 4400)
+        invalid = self.client.patch(
+            '/api/kbs/settings/?organization=' + str(self.sim_org.id),
+            {'tier2_policy': 'learn_itself'},
+            format='json',
+        )
+        self.assertEqual(invalid.status_code, 400)
 
     def test_explicit_on_override_clears_lockout_and_records_state(self):
         timestamp = '2026-08-03T09:15:00Z'

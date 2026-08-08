@@ -142,6 +142,7 @@ class Command(BaseCommand):
 
         kbs.mode = 'active'
         kbs.data_source = 'simulator'
+        kbs.tier2_policy = 'crisp'
         kbs.power_saving = False
         kbs.cycle_seconds = 5
         kbs.battery_capacity_Wh = 5000

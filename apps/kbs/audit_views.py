@@ -384,17 +384,24 @@ def _action_data(action):
 
 def _summary(decision):
     actions = list(decision.actions.all())
+    fuzzy = (
+        decision.facts.get('fuzzy_evaluation', {})
+        if isinstance(decision.facts, dict) else {}
+    )
     return {
         'event_id': str(decision.event_id),
         'organization': {'id': decision.organization_id, 'name': decision.organization.name},
         'tier': decision.tier, 'event_type': decision.event_type,
-        'engine': decision.engine, 'branch': decision.branch,
+        'engine': decision.engine, 'policy': decision.policy,
+        'branch': decision.branch,
         'trace_version': decision.trace_version,
         'legacy': decision.is_legacy,
         'occurred_at': decision.occurred_at, 'received_at': decision.received_at,
         'action_count': len(actions),
         'action_statuses': [action.status for action in actions],
         'edge_device': str(decision.edge_device_id) if decision.edge_device_id else None,
+        'fuzzy_evaluation': fuzzy if isinstance(fuzzy, dict) else {},
+        'counterfactual': decision.counterfactual,
     }
 
 
@@ -451,6 +458,11 @@ class DecisionLogDetailView(APIView):
         data = _summary(decision)
         data.update({
             'facts': decision.facts,
+            'fuzzy_evaluation': (
+                decision.facts.get('fuzzy_evaluation', {})
+                if isinstance(decision.facts, dict) else {}
+            ),
+            'counterfactual': decision.counterfactual,
             'trace': decision.trace,
             'actions': [_action_data(action) for action in decision.actions.all()],
             'alerts': [{

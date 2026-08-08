@@ -1,19 +1,19 @@
 from django.contrib import admin
 
 from .models import (
-    Alert, BreakerAction, EdgeDevice, KBSDecision, KBSSettings, ScheduledEvent,
-    Tier1SafetyState,
+    Alert, BreakerAction, EdgeDevice, KBSControllerState, KBSDecision,
+    KBSSettings, ScheduledEvent, Tier1SafetyState,
 )
 
 
 @admin.register(KBSSettings)
 class KBSSettingsAdmin(admin.ModelAdmin):
     list_display = (
-        'organization', 'mode', 'data_source', 'power_saving', 'cycle_seconds',
+        'organization', 'mode', 'data_source', 'tier2_policy', 'power_saving', 'cycle_seconds',
         'stability_threshold_percent', 'event_stability_threshold_percent',
         'night_reserve_percent',
     )
-    list_filter = ('mode', 'data_source', 'power_saving')
+    list_filter = ('mode', 'data_source', 'tier2_policy', 'power_saving')
     search_fields = ('organization__name',)
 
 
@@ -39,20 +39,42 @@ class BreakerActionInline(admin.TabularInline):
 @admin.register(KBSDecision)
 class KBSDecisionAdmin(admin.ModelAdmin):
     list_display = (
-        'event_id', 'organization', 'tier', 'event_type', 'branch',
+        'event_id', 'organization', 'tier', 'event_type', 'policy', 'branch',
         'occurred_at', 'received_at', 'edge_device',
     )
     list_filter = (
-        'tier', 'event_type', 'branch', 'organization', 'occurred_at',
+        'tier', 'event_type', 'policy', 'branch', 'organization', 'occurred_at',
         'edge_device__status',
     )
     search_fields = ('event_id', 'organization__name', 'branch', 'engine')
     readonly_fields = (
         'event_id', 'organization', 'edge_device', 'tier', 'event_type', 'engine',
-        'branch', 'facts', 'trace_version', 'trace', 'occurred_at', 'received_at',
+        'branch', 'policy', 'counterfactual', 'facts', 'trace_version', 'trace', 'occurred_at', 'received_at',
         'created_at',
     )
     inlines = [BreakerActionInline]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(KBSControllerState)
+class KBSControllerStateAdmin(admin.ModelAdmin):
+    list_display = (
+        'organization', 'current_band', 'candidate_band',
+        'consecutive_cycles', 'last_risk_score', 'last_evaluated_at',
+        'profile_version',
+    )
+    list_filter = ('current_band', 'candidate_band', 'profile_version')
+    search_fields = ('organization__name',)
+    readonly_fields = (
+        'organization', 'current_band', 'candidate_band',
+        'consecutive_cycles', 'last_risk_score', 'last_evaluated_at',
+        'profile_version', 'updated_at',
+    )
 
     def has_add_permission(self, request):
         return False

@@ -110,6 +110,10 @@ class SystemFacts:
     sudden_drop_fraction: float | None = None
     sudden_draw_W: float | None = None
     pv_day_min_W: float | None = None
+    battery_capacity_Wh: float = 5000.0
+    night_reserve_percent: float = 30.0
+    pv_power_valid: bool = True
+    load_power_valid: bool = True
 
 
 def facts_to_dict(facts):

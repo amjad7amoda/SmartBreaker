@@ -14,20 +14,23 @@ from apps.telemetry.models import Reading
 
 from .climate import CLIMATE_CSV_PATH, ClimateDataError, load_climate_rows
 from .contracts import TIER2_ENGINE
+from .engine.fuzzy import PROFILE_VERSION
 from .models import (
-    Alert, BreakerAction, KBSDecision, KBSSettings, Tier1SafetyState,
+    Alert, BreakerAction, KBSControllerState, KBSDecision, KBSSettings,
+    Tier1SafetyState,
 )
 from .services import run_cycle
 
 SETTINGS_EDITABLE_FIELDS = (
-    'cycle_seconds', 'power_saving', 'mode', 'data_source',
+    'cycle_seconds', 'power_saving', 'mode', 'data_source', 'tier2_policy',
+    'battery_capacity_Wh', 'night_reserve_percent', 'max_inverter_power_W',
     'battery_low_voltage_V', 'battery_low_margin_V', 'battery_shutdown_buffer_percent',
     'joule_deficit_limit_J', 'grid_present_min_V',
 )
 SETTINGS_SHARED_FIELDS = SETTINGS_EDITABLE_FIELDS + (
-    'battery_capacity_Wh', 'night_reserve_percent', 'stability_threshold_percent',
+    'stability_threshold_percent',
     'event_stability_threshold_percent', 'heatsink_temp_limit_C',
-    'deficit_window_minutes', 'max_inverter_power_W', 'sudden_drop_fraction',
+    'deficit_window_minutes', 'sudden_drop_fraction',
     'sudden_draw_W', 'baseline_minutes', 'motor_peak_minutes', 'event_prep_hours',
     'day_start', 'day_end', 'pv_day_min_W',
 )
@@ -121,6 +124,33 @@ def _tier1_safety_dict(safety):
     }
 
 
+def _fuzzy_evaluation(decision):
+    if decision is None or not isinstance(decision.facts, dict):
+        return {}
+    value = decision.facts.get('fuzzy_evaluation', {})
+    return value if isinstance(value, dict) else {}
+
+
+def _controller_state_dict(state):
+    if state is None:
+        return {
+            'current_band': 'watch',
+            'candidate_band': None,
+            'consecutive_cycles': 0,
+            'last_risk_score': None,
+            'last_evaluated_at': None,
+            'profile_version': PROFILE_VERSION,
+        }
+    return {
+        'current_band': state.current_band,
+        'candidate_band': state.candidate_band or None,
+        'consecutive_cycles': state.consecutive_cycles,
+        'last_risk_score': state.last_risk_score,
+        'last_evaluated_at': state.last_evaluated_at,
+        'profile_version': state.profile_version,
+    }
+
+
 class ClimateView(APIView):
     """Return validated source climatology; never substitute invented values."""
 
@@ -159,21 +189,28 @@ class RunCycleView(APIView):
             return Response({'detail': 'unknown organization'}, status=status.HTTP_404_NOT_FOUND)
         decision = run_cycle(org)
         if decision is None:
+            kbs, _ = KBSSettings.objects.get_or_create(organization=org)
             return Response({
                 'engine': TIER2_ENGINE,
+                'policy': kbs.tier2_policy,
                 'branch': None,
                 'facts': None,
+                'fuzzy_evaluation': {},
+                'counterfactual': {},
                 'actions': [],
                 'detail': 'skipped (observing mode or no readings)',
             })
         return Response({
             'engine': TIER2_ENGINE,
             'event_id': str(decision.event_id),
+            'policy': decision.policy,
             'branch': decision.branch,
             'trace_version': decision.trace_version,
             'trace': decision.trace,
             'created_at': decision.created_at,
             'facts': decision.facts,
+            'fuzzy_evaluation': _fuzzy_evaluation(decision),
+            'counterfactual': decision.counterfactual,
             'actions': [_action_dict(a) for a in decision.actions.select_related('breaker', 'decision')],
         })
 
@@ -206,6 +243,9 @@ class SimStateView(APIView):
         safety = Tier1SafetyState.objects.filter(
             organization=org,
         ).select_related('source_decision').first()
+        controller_state = KBSControllerState.objects.filter(
+            organization=org,
+        ).first()
         latest_reading = Reading.objects.filter(organization=org).first()
         breakers = Breaker.objects.filter(organization=org).select_related('status')
         return Response({
@@ -223,14 +263,23 @@ class SimStateView(APIView):
             'metadata': {
                 'engine': TIER2_ENGINE,
                 'data_source': kbs.data_source,
+                'policy': kbs.tier2_policy,
+                'fuzzy_profile': PROFILE_VERSION,
                 'generated_at': timezone.now(),
             },
+            'policy': kbs.tier2_policy,
+            'fuzzy_evaluation': _fuzzy_evaluation(latest),
+            'counterfactual': latest.counterfactual if latest else {},
+            'controller_state': _controller_state_dict(controller_state),
             'latest_decision': (
                 {
                     'event_id': str(latest.event_id),
                     'engine': latest.engine,
                     'tier': latest.tier,
                     'branch': latest.branch,
+                    'policy': latest.policy,
+                    'fuzzy_evaluation': _fuzzy_evaluation(latest),
+                    'counterfactual': latest.counterfactual,
                     'trace_version': latest.trace_version,
                     'legacy': latest.is_legacy,
                     'trace': latest.trace,
@@ -337,12 +386,16 @@ class SimResetView(SimulatorOnlyMixin, APIView):
             'breaker_readings': BreakerReading.objects.filter(breaker__organization=org).count(),
             'decisions': KBSDecision.objects.filter(organization=org).count(),
             'alerts': Alert.objects.filter(organization=org).count(),
+            'controller_states': KBSControllerState.objects.filter(
+                organization=org,
+            ).count(),
         }
         Reading.objects.filter(organization=org).delete()
         BreakerReading.objects.filter(breaker__organization=org).delete()
         KBSDecision.objects.filter(organization=org).delete()
         Alert.objects.filter(organization=org).delete()
         Tier1SafetyState.objects.filter(organization=org).delete()
+        KBSControllerState.objects.filter(organization=org).delete()
         Breaker.objects.filter(organization=org).update(
             child_lock=False, locked_out=False, lockout_reason='', locked_at=None,
         )

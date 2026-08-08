@@ -306,7 +306,16 @@ class DecisionAuditApiTests(APITestCase):
         self._upload(**self._device_headers())
         other_decision = KBSDecision.objects.create(
             organization=self.other_organization, tier='tier2',
-            branch='night.grid_on', facts={}, trace=[], trace_version=0,
+            branch='night.grid_on',
+            facts={'fuzzy_evaluation': {
+                'profile_version': 'mamdani-v1', 'valid': True,
+                'risk_score': 70, 'risk_band': 'high',
+            }},
+            trace=[], trace_version=0, policy='fuzzy_active',
+            counterfactual={
+                'policy': 'crisp', 'branch': 'night.calm.battery',
+                'actions': [],
+            },
         )
 
         owner_response = self.client.get(
@@ -332,3 +341,12 @@ class DecisionAuditApiTests(APITestCase):
         self.assertEqual(technician_response.json()['count'], 2)
         self.assertTrue(legacy_detail.json()['legacy'])
         self.assertEqual(legacy_detail.json()['trace'], [])
+        self.assertEqual(legacy_detail.json()['policy'], 'fuzzy_active')
+        self.assertEqual(
+            legacy_detail.json()['fuzzy_evaluation']['profile_version'],
+            'mamdani-v1',
+        )
+        self.assertEqual(
+            legacy_detail.json()['counterfactual']['branch'],
+            'night.calm.battery',
+        )

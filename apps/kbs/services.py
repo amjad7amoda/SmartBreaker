@@ -1,5 +1,6 @@
 """Application services that orchestrate the pure KBS through an adapter."""
 
+from contextlib import nullcontext
 import logging
 
 from .engine import decide
@@ -37,12 +38,16 @@ def run_cycle(organization, now=None, adapter=None):
         return None
 
     make_decision = getattr(adapter, 'make_decision', None)
-    result = (
-        make_decision(organization, facts, decide)
-        if make_decision is not None
-        else decide(facts)
+    decision_transaction = getattr(
+        adapter, 'decision_transaction', nullcontext,
     )
-    decision = adapter.persist_result(organization, facts, result)
+    with decision_transaction():
+        result = (
+            make_decision(organization, facts, decide)
+            if make_decision is not None
+            else decide(facts)
+        )
+        decision = adapter.persist_result(organization, facts, result)
     logger.info(
         'KBS decision persisted: org=%s branch=%s',
         organization.id,

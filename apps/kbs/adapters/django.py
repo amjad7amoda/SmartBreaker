@@ -16,13 +16,17 @@ from ..engine.derived import (
     joule_deficit_J, mean, ramped_threshold,
 )
 from ..engine.facts import BreakerFacts, SystemFacts, facts_to_dict
-from ..engine.rules import decide as decide_tier2
+from ..engine.fuzzy import (
+    PROFILE_VERSION, ControllerSnapshot, advance_controller, evaluate_fuzzy,
+)
+from ..engine.rules import decide as decide_tier2, decide_fuzzy
 from ..interlock import (
     Tier1SafetyCommand, Tier1SafetySnapshot, is_interlock_result,
     mirror_tier1_decision,
 )
 from ..models import (
-    Alert, BreakerAction, KBSDecision, KBSSettings, Tier1SafetyState,
+    Alert, BreakerAction, KBSControllerState, KBSDecision, KBSSettings,
+    Tier1SafetyState,
 )
 from ..weather import get_weather_context
 
@@ -32,6 +36,48 @@ ALERT_COOLDOWN_MINUTES = 5
 ACTION_DEDUPE_MINUTES = 10
 
 logger = logging.getLogger(__name__)
+
+
+def _result_payload(result, policy):
+    if result is None:
+        return {'policy': policy, 'branch': None, 'actions': [], 'alerts': []}
+    return {
+        'policy': policy,
+        'branch': result.branch,
+        'actions': [{
+            'device_id': action.device_id,
+            'action': action.action,
+            'countdown_s': action.countdown_s,
+            'reason': action.reason,
+            'lockout': action.lockout,
+        } for action in result.actions],
+        'alerts': [{
+            'kind': alert.kind,
+            'severity': alert.severity,
+            'message': alert.message,
+        } for alert in result.alerts],
+        'trace_version': result.trace_version,
+        'trace': result.trace,
+    }
+
+
+def _authoritative_evaluation(reason):
+    return {
+        'profile_version': PROFILE_VERSION,
+        'valid': False,
+        'fallback_reason': reason,
+        'inputs': {},
+        'memberships': {},
+        'fired_rules': [],
+        'aggregated_strengths': {},
+        'risk_score': None,
+        'inferred_band': None,
+        'risk_band': None,
+        'controller': {
+            'transition': 'not_evaluated',
+            'advanced': False,
+        },
+    }
 
 
 def _dispatch_real_actions(action_ids):
@@ -46,6 +92,11 @@ def _dispatch_real_actions(action_ids):
 
 
 class DjangoKBSAdapter:
+    @staticmethod
+    def decision_transaction():
+        """Keep safety selection, fuzzy state, and persistence on one lock."""
+        return transaction.atomic()
+
     def get_settings(self, organization):
         settings, _ = KBSSettings.objects.get_or_create(organization=organization)
         return settings
@@ -78,6 +129,14 @@ class DjangoKBSAdapter:
         day_start = weather.sunrise or settings.day_start
         day_end = weather.sunset or settings.day_end
         pv_now_W = self._pv_power_W(latest)
+        pv_power_valid = (
+            latest.pv_charging_power_W is not None
+            or (
+                latest.pv_input_voltage_V is not None
+                and latest.pv_input_current_A is not None
+            )
+        )
+        load_power_valid = latest.ac_output_active_power_W is not None
         load_now_W = latest.ac_output_active_power_W or 0.0
         baseline_cutoff = cycle_time - timedelta(minutes=settings.baseline_minutes)
         baseline_rows = [
@@ -204,14 +263,116 @@ class DjangoKBSAdapter:
             sudden_drop_fraction=settings.sudden_drop_fraction,
             sudden_draw_W=settings.sudden_draw_W,
             pv_day_min_W=settings.pv_day_min_W,
+            battery_capacity_Wh=settings.battery_capacity_Wh,
+            night_reserve_percent=settings.night_reserve_percent,
+            pv_power_valid=pv_power_valid,
+            load_power_valid=load_power_valid,
         )
 
+    @transaction.atomic
     def make_decision(self, organization, facts, default_decider):
         """Bypass normal Tier-2 rules while Tier-1 owns an active danger."""
+        # When run_cycle supplies its outer transaction this lock remains held
+        # through persist_result, so Tier-1 cannot activate between fuzzy-state
+        # advancement and the authoritative decision row.
+        Organization.objects.select_for_update().only('id').get(
+            pk=organization.pk,
+        )
+        settings = self.get_settings(organization)
         safety = self._safety_snapshot(organization)
         if safety.active:
-            return mirror_tier1_decision(facts, safety)
-        return default_decider(facts)
+            result = mirror_tier1_decision(facts, safety)
+            result.policy = settings.tier2_policy
+            if settings.tier2_policy != 'crisp':
+                result.fuzzy_evaluation = _authoritative_evaluation(
+                    'tier1_interlock_authoritative',
+                )
+                result.counterfactual = _result_payload(result, 'crisp')
+            return result
+        return self._normal_policy_decision(
+            organization, settings, facts, default_decider,
+        )
+
+    @transaction.atomic
+    def _normal_policy_decision(
+        self, organization, settings, facts, default_decider,
+    ):
+        crisp_result = default_decider(facts)
+        crisp_result.policy = settings.tier2_policy
+        if settings.tier2_policy == 'crisp':
+            return crisp_result
+
+        if crisp_result.branch in ('protect_inverter.overload', 'protect_battery'):
+            crisp_result.fuzzy_evaluation = _authoritative_evaluation(
+                'hard_protection_authoritative',
+            )
+            crisp_result.counterfactual = _result_payload(
+                crisp_result,
+                'fuzzy_active' if settings.tier2_policy == 'fuzzy_shadow' else 'crisp',
+            )
+            return crisp_result
+
+        # Serializing on the organization also protects creation of its
+        # one-to-one state during the first fuzzy cycle.
+        Organization.objects.select_for_update().only('id').get(pk=organization.pk)
+        state, _ = KBSControllerState.objects.select_for_update().get_or_create(
+            organization=organization,
+        )
+        snapshot = ControllerSnapshot(
+            current_band=state.current_band,
+            candidate_band=state.candidate_band,
+            consecutive_cycles=state.consecutive_cycles,
+            last_risk_score=state.last_risk_score,
+            last_evaluated_at=state.last_evaluated_at,
+            profile_version=state.profile_version,
+        )
+        evaluation = evaluate_fuzzy(facts)
+        # Hysteresis freshness is about controller executions. Simulator fact
+        # timestamps advance with the accelerated physical clock and would
+        # otherwise make every five-real-second cycle look stale.
+        evaluated_at = timezone.now()
+        next_snapshot, transition = advance_controller(
+            snapshot, evaluation, evaluated_at, settings.cycle_seconds,
+        )
+        evaluation['controller'] = transition
+        evaluation['risk_band'] = next_snapshot.current_band
+        if next_snapshot != snapshot:
+            state.current_band = next_snapshot.current_band
+            state.candidate_band = next_snapshot.candidate_band
+            state.consecutive_cycles = next_snapshot.consecutive_cycles
+            state.last_risk_score = next_snapshot.last_risk_score
+            state.last_evaluated_at = next_snapshot.last_evaluated_at
+            state.profile_version = next_snapshot.profile_version
+            state.save()
+
+        fuzzy_result = (
+            decide_fuzzy(
+                facts, next_snapshot.current_band,
+                evaluation=evaluation, crisp_result=crisp_result,
+            )
+            if evaluation['valid'] else None
+        )
+        if settings.tier2_policy == 'fuzzy_shadow':
+            crisp_result.fuzzy_evaluation = evaluation
+            crisp_result.counterfactual = _result_payload(
+                fuzzy_result, 'fuzzy_active',
+            )
+            if fuzzy_result is None:
+                crisp_result.counterfactual['fallback_reason'] = evaluation[
+                    'fallback_reason'
+                ]
+            return crisp_result
+
+        if fuzzy_result is None:
+            # Active mode retains the configured policy in the audit row while
+            # executing the complete crisp result as its safe fallback.
+            crisp_result.fuzzy_evaluation = evaluation
+            crisp_result.counterfactual = _result_payload(crisp_result, 'crisp')
+            return crisp_result
+        fuzzy_result.policy = settings.tier2_policy
+        fuzzy_result.fuzzy_evaluation = evaluation
+        fuzzy_result.counterfactual = _result_payload(crisp_result, 'crisp')
+        return fuzzy_result
 
     @transaction.atomic
     def persist_result(self, organization, facts, result):
@@ -220,20 +381,34 @@ class DjangoKBSAdapter:
         # danger starts or clears while Tier-2 is building facts.
         Organization.objects.select_for_update().only('id').get(pk=organization.pk)
         safety = self._safety_snapshot(organization, for_update=True)
+        settings = self.get_settings(organization)
         if safety.active:
             result = mirror_tier1_decision(facts, safety)
+            result.policy = settings.tier2_policy
+            if settings.tier2_policy != 'crisp':
+                result.fuzzy_evaluation = _authoritative_evaluation(
+                    'tier1_interlock_authoritative',
+                )
+                result.counterfactual = _result_payload(result, 'crisp')
         elif is_interlock_result(result):
-            result = decide_tier2(facts)
+            result = self._normal_policy_decision(
+                organization, settings, facts, decide_tier2,
+            )
 
         trace = list(result.trace)
+        stored_facts = facts_to_dict(facts)
+        if result.fuzzy_evaluation:
+            stored_facts['fuzzy_evaluation'] = result.fuzzy_evaluation
         decision = KBSDecision.objects.create(
             organization=organization,
             tier='tier2', event_type='decision',
             engine=TIER2_ENGINE,
             branch=result.branch,
-            facts=facts_to_dict(facts),
+            facts=stored_facts,
             trace_version=result.trace_version,
             trace=trace,
+            policy=result.policy,
+            counterfactual=result.counterfactual,
             occurred_at=facts.now,
         )
         dispatch_ids = []
@@ -289,7 +464,6 @@ class DjangoKBSAdapter:
         if trace != decision.trace:
             decision.trace = trace
             decision.save(update_fields=['trace'])
-        settings = self.get_settings(organization)
         if settings.data_source == 'real' and dispatch_ids:
             transaction.on_commit(
                 lambda ids=tuple(dispatch_ids): _dispatch_real_actions(ids),

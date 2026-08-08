@@ -14,12 +14,20 @@ from .contracts import TIER2_ENGINE
 class KBSSettings(models.Model):
     MODE_CHOICES = [('observing', 'Observing'), ('active', 'Active')]
     DATA_SOURCE_CHOICES = [('real', 'Real Site'), ('simulator', 'Simulator')]
+    TIER2_POLICY_CHOICES = [
+        ('crisp', 'Crisp'),
+        ('fuzzy_shadow', 'Fuzzy shadow'),
+        ('fuzzy_active', 'Fuzzy active'),
+    ]
 
     organization = models.OneToOneField(
         Organization, on_delete=models.CASCADE, related_name='kbs_settings'
     )
     mode = models.CharField(max_length=20, choices=MODE_CHOICES, default='observing')
     data_source = models.CharField(max_length=20, choices=DATA_SOURCE_CHOICES, default='real')
+    tier2_policy = models.CharField(
+        max_length=20, choices=TIER2_POLICY_CHOICES, default='crisp',
+    )
     power_saving = models.BooleanField(default=False)
     cycle_seconds = models.PositiveIntegerField(default=300)
     battery_capacity_Wh = models.FloatField(default=5000.0)
@@ -50,6 +58,31 @@ class KBSSettings(models.Model):
 
     def __str__(self):
         return f'KBS settings for {self.organization.name} ({self.mode})'
+
+
+class KBSControllerState(models.Model):
+    BAND_CHOICES = [('low', 'Low'), ('watch', 'Watch'), ('high', 'High')]
+
+    organization = models.OneToOneField(
+        Organization, on_delete=models.CASCADE, related_name='kbs_controller_state'
+    )
+    current_band = models.CharField(
+        max_length=10, choices=BAND_CHOICES, default='watch',
+    )
+    candidate_band = models.CharField(
+        max_length=10, choices=BAND_CHOICES, blank=True, default='',
+    )
+    consecutive_cycles = models.PositiveSmallIntegerField(default=0)
+    last_risk_score = models.FloatField(null=True, blank=True)
+    last_evaluated_at = models.DateTimeField(null=True, blank=True)
+    profile_version = models.CharField(max_length=64, default='mamdani-v1')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return (
+            f'{self.organization_id} fuzzy controller: {self.current_band} '
+            f'({self.candidate_band or "-"} x{self.consecutive_cycles})'
+        )
 
 
 class ScheduledEvent(models.Model):
@@ -123,6 +156,10 @@ class KBSDecision(models.Model):
     facts = models.JSONField(default=dict)
     trace_version = models.PositiveSmallIntegerField(default=1)
     trace = models.JSONField(default=list)
+    policy = models.CharField(
+        max_length=20, choices=KBSSettings.TIER2_POLICY_CHOICES, default='crisp',
+    )
+    counterfactual = models.JSONField(default=dict)
     occurred_at = models.DateTimeField(default=timezone.now)
     received_at = models.DateTimeField(auto_now_add=True)
     # Existing clients and ordering continue to use created_at.

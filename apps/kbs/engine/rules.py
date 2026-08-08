@@ -45,6 +45,9 @@ class RuleResult:
     alerts: list = field(default_factory=list)
     trace_version: int = TRACE_VERSION
     trace: list = field(default_factory=list)
+    policy: str = 'crisp'
+    fuzzy_evaluation: dict = field(default_factory=dict)
+    counterfactual: dict = field(default_factory=dict)
 
 
 def _finish(result, trace):
@@ -509,3 +512,101 @@ def _set_grid(facts, result, on, reason, trace):
     result.actions.append(ActionIntent(
         grid.id, grid.device_id, 'on' if on else 'off', reason,
     ))
+
+
+def decide_fuzzy(facts, band, evaluation=None, crisp_result=None):
+    """Apply a hysteretic fuzzy band after the existing hard protections.
+
+    Calling the crisp engine first is intentional: its inverter-overload and
+    battery-floor branches remain authoritative. For normal energy management,
+    only diagnostic PV/heat alerts are carried forward; the fuzzy trend
+    replaces the crisp sudden-drop boolean as the response signal.
+    """
+    crisp_result = crisp_result or decide(facts)
+    if crisp_result.branch in ('protect_inverter.overload', 'protect_battery'):
+        return crisp_result
+
+    evaluation = evaluation or {}
+    trace = []
+    _step(
+        trace, 'tier2.fuzzy.profile', 'calculation', 'selected',
+        'Selected the hysteretic fuzzy risk band for normal Tier-2 control.',
+        profile_version=evaluation.get('profile_version'),
+        risk_score=evaluation.get('risk_score'), risk_band=band,
+        inferred_band=evaluation.get('inferred_band'),
+    )
+    result = RuleResult(branch=f'fuzzy.{band}')
+    # Keep diagnosis, not the crisp sudden-drop energy response.
+    result.alerts.extend(
+        alert for alert in crisp_result.alerts
+        if alert.kind in ('panel_fault', 'weather_drop', 'inverter_protection')
+    )
+
+    if band == 'low':
+        if facts.is_daytime:
+            result.branch = 'fuzzy.low.day.comfort_on'
+            _turn_on_due_comfort(facts, result, trace)
+            _set_grid(facts, result, False, 'fuzzy low risk: PV/battery cover the loads', trace)
+        else:
+            result.branch = 'fuzzy.low.night.retain'
+            _step(
+                trace, 'tier2.fuzzy.low.night', 'noop', 'noop',
+                'Low night risk retains load states and requests grid OFF.',
+            )
+            _set_grid(facts, result, False, 'fuzzy low night risk: battery reserve is adequate', trace)
+    elif band == 'watch':
+        result.branch = 'fuzzy.watch.preserve'
+        _step(
+            trace, 'tier2.fuzzy.watch.preserve', 'noop', 'noop',
+            'Watch band preserves current load and grid states.',
+        )
+    elif band == 'high':
+        if facts.power_saving:
+            result.branch = 'fuzzy.high.power_saving'
+            budget_W = float(
+                evaluation.get('inputs', {}).get('safe_budget_W', facts.pv_power_W)
+            )
+            _keep_best_subset(facts, result, budget_W, trace)
+            _set_grid(facts, result, False, 'fuzzy high risk with power saving: no grid purchase', trace)
+            culprit = _culprit(facts)
+            can_trip = (
+                not facts.is_daytime and facts.sudden_draw and culprit is not None
+                and culprit.priority_type in ('normal', 'comfort')
+                and not culprit.event_required and not culprit.recently_tripped
+            )
+            _guard(
+                trace, 'tier2.fuzzy.guard.trip_culprit', can_trip,
+                'Retained the night sudden-draw culprit eligibility rule.',
+                culprit=culprit.device_id if culprit else None,
+                event_required=culprit.event_required if culprit else None,
+                recently_tripped=culprit.recently_tripped if culprit else None,
+            )
+            if can_trip:
+                existing = next(
+                    (action for action in result.actions if action.breaker_id == culprit.id),
+                    None,
+                )
+                reason = 'night sudden draw endangers the fuzzy reserve budget'
+                if existing is None:
+                    result.actions.append(ActionIntent(
+                        culprit.id, culprit.device_id, 'off', reason, lockout=True,
+                    ))
+                else:
+                    existing.reason = reason
+                    existing.lockout = True
+                result.alerts.append(AlertIntent(
+                    'night_trip', 'warning',
+                    f'Breaker {culprit.device_id} tripped: its sudden draw endangers '
+                    'the mandatory night reserve. Re-enable it manually to override.',
+                ))
+        else:
+            result.branch = 'fuzzy.high'
+            _buy_grid_or_shed(
+                facts, result, 'fuzzy.high',
+                'fuzzy high risk: grid takes over normal energy management', trace,
+            )
+    else:
+        raise ValueError(f'unknown fuzzy controller band: {band}')
+
+    _ensure_event_required_on(facts, result, trace)
+    return _finish(result, trace)

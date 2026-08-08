@@ -14,7 +14,7 @@ class OrganizationPollingMiddleware:
         response = self.get_response(request)
 
         user = getattr(request, 'user', None)
-        if user is None or not user.is_authenticated:
+        if user is None or not getattr(user, 'is_authenticated', False):
             return response
 
         try:

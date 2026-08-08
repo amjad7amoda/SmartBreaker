@@ -3,3 +3,7 @@
 **.idea
 **.env
 **venv**
+
+# Local service/runtime state
+celerybeat-schedule*
+edge/tier1_audit.sqlite3*

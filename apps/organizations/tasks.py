@@ -9,7 +9,7 @@ from .models import Organization
 def send_organization_approved_email_task(org_id):
     org = Organization.objects.get(id=org_id)
     send_branded_email(
-        subject='Organization Approved | Fluxa',
+        subject='اعتماد المؤسسة | Organization Approved | Fluxa',
         recipient=org.owner.email,
         preheader=f'تم اعتماد مؤسستك "{org.name}" وأصبحت نشطة الآن.',
         status='active',
@@ -24,7 +24,7 @@ def send_organization_approved_email_task(org_id):
 @shared_task
 def send_organization_denied_email_task(owner_email, organization_name):
     send_branded_email(
-        subject='Organization Denied | Fluxa',
+        subject='رفض المؤسسة | Organization Denied | Fluxa',
         recipient=owner_email,
         preheader=f'لم تتم الموافقة على طلب إنشاء المؤسسة "{organization_name}".',
         status='denied',

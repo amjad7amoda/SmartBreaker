@@ -7,7 +7,10 @@ load_dotenv()
 SECRET_KEY = os.getenv('SECRET_KEY')
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
-BASE_DIR = Path(__file__).resolve().parent.parent
+# Three parents: this file is config/settings/base.py, so the repository root is
+# three levels up. Two would land in config/ and put staticfiles/ inside the
+# settings package.
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 
 # Quick-start development settings - unsuitable for production
@@ -57,7 +60,6 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    'apps.breakers.middleware.OrganizationPollingMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -97,7 +99,6 @@ DATABASES = {
 
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
-
 AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
@@ -115,17 +116,17 @@ AUTH_PASSWORD_VALIDATORS = [
 
 
 # Internationalization
-# https://docs.djangoproject.com/en/6.0/topics/i18n/
 LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'Asia/Damascus'  # site-local wall clock: schedule windows, day_start/day_end and the KBS day/night logic all read in this zone (storage stays UTC)
+TIME_ZONE = 'Asia/Damascus'
 USE_I18N = True
 USE_TZ = True
 
 
 # Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/6.0/howto/static-files/
 STATIC_URL = 'static/'
-AUTH_USER_MODEL = 'accounts.User'
+# Unused while DEBUG serves static files directly, but collectstatic refuses to
+# run without a destination, so keep one defined.
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
@@ -136,43 +137,45 @@ REST_FRAMEWORK = {
     ),
 }
 
+# Auth Model / JWT Settings
+AUTH_USER_MODEL = 'accounts.User'
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=30),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'ROTATE_REFRESH_TOKENS': True,
 }
 
+# Email Settings
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = os.getenv('EMAIL_HOST') or 'smtp.gmail.com'
 EMAIL_PORT = int(os.getenv('EMAIL_PORT') or '587')
 EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER')
 EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD')
-
-# `or` rather than a getenv default: a blank var in .env must fall through too,
-# otherwise Django rejects '' as the sender address.
 DEFAULT_FROM_EMAIL = (
     os.getenv('DEFAULT_FROM_EMAIL') or EMAIL_HOST_USER or 'no-reply@smartbreaker.local'
 )
 EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True') == 'True'
 
-# Encrypts third-party credentials (Tuya client_secret) at rest. Rotating this
-# key makes every stored secret unreadable — they must then be re-entered.
+# Tuya Platform
 TUYA_FERNET_KEY = os.getenv('TUYA_FERNET_KEY')
 
+# Breaker polling and reading retention
+BREAKER_POLL_SECONDS = int(os.getenv('BREAKER_POLL_SECONDS') or '30')
+BREAKER_READING_RETENTION_MINUTES = int(
+    os.getenv('BREAKER_READING_RETENTION_MINUTES') or '60'
+)
+BREAKER_PURGE_SECONDS = int(os.getenv('BREAKER_PURGE_SECONDS') or '300')
+
+# Celery Beat and Worker CONSTANTS
 CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
 CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TASK_ALWAYS_EAGER = os.getenv('CELERY_TASK_ALWAYS_EAGER', 'False') == 'True'
-
-# Per-organization pollers are created while the server is running, so beat has to
-# read its schedule from the database rather than from a static dict in here.
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 
-# The Tuya token, the device specification cache and the polled breaker statuses all
-# have to be visible to every web worker *and* to the Celery worker. LocMemCache is
-# per-process, so without a shared backend the poller warms a cache nobody else reads.
+# Cache Settings: if CACHE_URL is set, use Redis; otherwise, use local memory cache.
 CACHE_URL = os.getenv('CACHE_URL') or os.getenv('REDIS_URL')
 CACHES = {
     'default': {
@@ -185,10 +188,18 @@ CACHES = {
 }
 
 CELERY_BEAT_SCHEDULE = {
-    # KBS dispatcher: checks every minute which sites' cycle period (K,
-    # KBSSettings.cycle_seconds) has elapsed and queues their decision cycle.
-    'kbs-dispatch': {
-        'task': 'apps.kbs.tasks.run_kbs_cycles',
-        'schedule': 60.0,  # dispatcher period (s)
+    # Always on: the KBS reads persisted breaker state every cycle, so polling cannot
+    # depend on someone being signed in.
+    'poll-breakers': {
+        'task': 'apps.breakers.tasks.poll_all_breakers',
+        'schedule': float(BREAKER_POLL_SECONDS),
     },
+    'purge-breaker-readings': {
+        'task': 'apps.breakers.tasks.purge_breaker_readings',
+        'schedule': float(BREAKER_PURGE_SECONDS),
+    },
+    # 'kbs-dispatch': {
+    #     'task': 'apps.kbs.tasks.run_kbs_cycles',
+    #     'schedule': 60.0,
+    # },
 }

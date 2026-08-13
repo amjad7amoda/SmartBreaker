@@ -30,8 +30,10 @@ requirements.txt         Python dependencies
 manage.py
 ```
 
-Settings are split under `config/settings/`: `base.py` (shared), `development.py`,
-`production.py`. `manage.py` and `celery.py` default to `config.settings.development`.
+Settings are split under `config/settings/`: `base.py` (shared), `development.py`
+and `test.py`. Everything — the containers included — runs `development.py`; the
+database lives only in the `db` container, so there is no local Postgres to keep
+in sync.
 
 ## Local setup with Docker (recommended)
 
@@ -116,7 +118,8 @@ server without a rebuild. Rebuild only when `requirements.txt` changes:
    ```bash
    celery -A config worker -l info
    ```
-8. **Run Celery beat** (dispatches per-site polling and Tier-2 cycles):
+8. **Run Celery beat** (dispatches breaker polling, reading retention and Tier-2
+   cycles):
    ```bash
    celery -A config beat -l info
    ```

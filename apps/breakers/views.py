@@ -1,6 +1,8 @@
 from django.db import transaction
+from django.shortcuts import get_object_or_404
 from rest_framework import generics, status
 from rest_framework.exceptions import ValidationError
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -9,8 +11,9 @@ from apps.accounts.permissions import (
     IsTechnicianOrAdmin,
     IsTechnicianOrAdminOrReadOnly,
 )
+from apps.query_params import filter_by_time_window
 
-from . import exceptions, scheduling, services
+from . import exceptions, services
 from .models import (
     Breaker,
     BreakerAction,
@@ -23,8 +26,10 @@ from .serializers import (
     BreakerChildLockSerializer,
     BreakerCountdownSerializer,
     BreakerCreateSerializer,
+    BreakerReadingSerializer,
     BreakerSerializer,
     BreakerStatusIngestSerializer,
+    BreakerStatusSerializer,
     BreakerSwitchSerializer,
     BreakerUpdateSerializer,
     TuyaCredentialSerializer,
@@ -39,9 +44,15 @@ def scoped_breakers(user):
     return queryset.filter(organization__owner=user)
 
 
-class BreakerStatusIngestView(APIView):
-    """Ingest one simulator/Pi snapshot for every breaker in the payload."""
+class ReadingPagination(PageNumberPagination):
+    page_size = 100
+    page_size_query_param = 'page_size'
+    max_page_size = 1000
 
+
+
+
+class BreakerStatusIngestView(APIView):
     permission_classes = [AllowAny]
 
     @transaction.atomic
@@ -78,6 +89,9 @@ class BreakerStatusIngestView(APIView):
             status_row.child_lock = item['child_lock']
             status_row.cycle_time = item['cycle_time']
             status_row.online = item['online']
+            # The Pi and the simulator both report in raw device units, so
+            # there is no spec lookup that could have failed.
+            status_row.units_resolved = True
             if item['switch'] and not previous_switch:
                 status_row.last_switched_on_at = item['timestamp']
             status_row.save()
@@ -89,10 +103,7 @@ class BreakerStatusIngestView(APIView):
             _, created = BreakerReading.objects.get_or_create(
                 breaker=breaker,
                 timestamp=item['timestamp'],
-                defaults={
-                    'switch': item['switch'],
-                    'cur_power_mW': item.get('cur_power_mW'),
-                },
+                defaults=status_row.as_sample(),
             )
             readings_created += int(created)
 
@@ -155,6 +166,14 @@ class BreakerDeleteView(generics.DestroyAPIView):
 
 
 class BreakerStatusView(generics.RetrieveAPIView):
+    """Current status of one breaker, always read live from the device.
+
+    Every call reaches Tuya, so the answer is never stale — at the cost of the
+    round trip and of counting against Tuya's rate limit. Callers that only
+    need the last known state should read ``/statuses/<device_id>/`` instead,
+    which serves the row the poller stored.
+    """
+
     permission_classes = [IsAuthenticated]
     serializer_class = BreakerSerializer
     lookup_field = 'device_id'
@@ -165,11 +184,6 @@ class BreakerStatusView(generics.RetrieveAPIView):
     def retrieve(self, request, *args, **kwargs):
         breaker = self.get_object()
         include_raw = request.query_params.get('raw') in ('1', 'true')
-        if not include_raw:
-            cached = scheduling.cached_status(breaker.device_id)
-            if cached is not None:
-                return Response(cached)
-
         try:
             breaker_status = services.read_status(
                 breaker, include_raw=include_raw,
@@ -179,6 +193,87 @@ class BreakerStatusView(generics.RetrieveAPIView):
         except TuyaError as exc:
             raise exceptions.translate(exc, field='device_id')
         return Response(breaker_status)
+
+
+class BreakerStatusListView(generics.ListAPIView):
+    """Last stored snapshot of every breaker in scope.
+
+    Unlike ``BreakerStatusView`` this never talks to Tuya: it serves what the
+    Pi/simulator last pushed, so it is safe to poll from a dashboard. Breakers
+    that have never reported have no row yet and are absent from the list.
+    """
+
+    permission_classes = [IsAuthenticated]
+    serializer_class = BreakerStatusSerializer
+
+    def get_queryset(self):
+        queryset = BreakerStatus.objects.filter(
+            breaker__in=scoped_breakers(self.request.user),
+        ).select_related('breaker', 'breaker__organization')
+
+        params = self.request.query_params
+        for field, lookup in (
+            ('device_id', 'breaker__device_id'),
+            ('organization', 'breaker__organization_id'),
+        ):
+            value = params.get(field)
+            if value:
+                queryset = queryset.filter(**{lookup: value})
+        # Query params follow the response contract, not the column names.
+        for param, column in (('is_on', 'switch'), ('online', 'online')):
+            value = params.get(param)
+            if value:
+                queryset = queryset.filter(
+                    **{column: value in ('1', 'true', 'True')},
+                )
+        return queryset.order_by('breaker__organization_id', 'breaker__device_id')
+
+
+class BreakerStoredStatusView(generics.RetrieveAPIView):
+    """Last stored snapshot of one breaker, keyed by device id."""
+
+    permission_classes = [IsAuthenticated]
+    serializer_class = BreakerStatusSerializer
+    lookup_field = 'breaker__device_id'
+    lookup_url_kwarg = 'device_id'
+
+    def get_queryset(self):
+        return BreakerStatus.objects.filter(
+            breaker__in=scoped_breakers(self.request.user),
+        ).select_related('breaker', 'breaker__organization')
+
+
+class BreakerReadingListView(generics.ListAPIView):
+    """Per-breaker sample history, newest first.
+
+    Mounted both at ``/readings/`` (filter with ``?device_id=``) and at
+    ``/<device_id>/readings/``, where an unknown or out-of-scope device is a 404
+    rather than an empty page.
+    """
+
+    permission_classes = [IsAuthenticated]
+    serializer_class = BreakerReadingSerializer
+    pagination_class = ReadingPagination
+
+    def get_queryset(self):
+        breakers = scoped_breakers(self.request.user)
+        device_id = self.kwargs.get('device_id')
+        if device_id:
+            breakers = [get_object_or_404(breakers, device_id=device_id)]
+
+        queryset = BreakerReading.objects.filter(
+            breaker__in=breakers,
+        ).select_related('breaker', 'breaker__organization')
+
+        params = self.request.query_params
+        for field, lookup in (
+            ('device_id', 'breaker__device_id'),
+            ('organization', 'breaker__organization_id'),
+        ):
+            value = params.get(field)
+            if value and not device_id:
+                queryset = queryset.filter(**{lookup: value})
+        return filter_by_time_window(queryset, params)
 
 
 class BreakerSwitchView(generics.GenericAPIView):

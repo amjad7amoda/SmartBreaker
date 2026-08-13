@@ -9,7 +9,7 @@ from pathlib import Path
 from django.conf import settings
 
 
-CLIMATE_CSV_PATH = Path(settings.BASE_DIR).parent / 'simulator' / 'data' / 'solar_data.csv'
+CLIMATE_CSV_PATH = Path(settings.BASE_DIR) / 'simulator' / 'data' / 'solar_data.csv'
 EXPECTED_COLUMNS = (
     'city', 'latitude_deg', 'longitude_deg', 'month', 'season',
     'typical_weather', 'ghi_kwh_m2_day', 'clearsky_ghi_kwh_m2_day',

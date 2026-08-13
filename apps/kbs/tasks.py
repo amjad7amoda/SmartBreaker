@@ -29,10 +29,6 @@ def run_kbs_cycles():
 
 @shared_task
 def run_kbs_cycle_for_org(organization_id):
-    """Run one KBS cycle for one site.
-
-    organization_id: Organization primary key (unitless)
-    """
     organization = Organization.objects.get(id=organization_id)
     decision = run_cycle(organization)
     return decision.branch if decision else None

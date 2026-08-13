@@ -10,6 +10,7 @@ x-app: &app
     CELERY_RESULT_BACKEND: redis://redis:6379/0
 
     REDIS_URL: redis://redis:6379/1
+    DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings.development}
   volumes:
     - .:/app
 
@@ -20,8 +21,7 @@ services:
       POSTGRES_DB: ${DB_NAME:-smartbreaker}
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
-    # 5433 on the host: 5432 is usually taken by a natively installed Postgres.
-    # Inside the compose network the other services still use db:5432.
+
     ports:
       - "5433:5432"
     volumes:
@@ -35,51 +35,47 @@ services:
   redis:
     image: redis:8-alpine
     ports:
-      - "6379:6379"
-healthcheck:
-        test: ["CMD", "redis-cli", "ping"]
-        interval: 5s
-        timeout: 3s
-        retries: 10
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
-    migrate:
-      <<: *app
-      command: python manage.py migrate --noinput
-      depends_on:
-        db:
-          condition: service_healthy
+  web:
+    <<: *app
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py runserver 0.0.0.0:8000"
 
-    web:
-      <<: *app
-      command: python manage.py runserver 0.0.0.0:8000
-      ports:
-        - "8000:8000"
-      restart: unless-stopped
-      depends_on:
-        migrate:
-          condition: service_completed_successfully
-        redis:
-          condition: service_healthy
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
-    worker:
-      <<: *app
-      command: celery -A config worker -l info
-      restart: unless-stopped
-      depends_on:
-        migrate:
-          condition: service_completed_successfully
-        redis:
-          condition: service_healthy
+  worker:
+    <<: *app
+    command: celery -A config worker -l info
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
-    beat:
-      <<: *app
-      command: celery -A config beat -l info
-      restart: unless-stopped
-      depends_on:
-        migrate:
-          condition: service_completed_successfully
-        redis:
-          condition: service_healthy
-
-  volumes:
-    pgdata:
+  beat:
+    <<: *app
+    command: celery -A config beat -l info
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+        
+volumes:
+  pgdata:

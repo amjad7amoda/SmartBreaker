@@ -28,3 +28,14 @@ class ReadingSerializer(serializers.ModelSerializer):
             'eeprom_version', 'pv_charging_power_W', 'device_status_flags2',
         )
         read_only_fields = ('received_at',)
+
+
+class ReadingOutputSerializer(ReadingSerializer):
+    """Read-side view of a reading: same fields plus the site name."""
+
+    organization_name = serializers.CharField(
+        source='organization.name', read_only=True,
+    )
+
+    class Meta(ReadingSerializer.Meta):
+        fields = ReadingSerializer.Meta.fields + ('organization_name',)

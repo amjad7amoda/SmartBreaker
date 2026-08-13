@@ -450,7 +450,7 @@ class BreakerOverrideView(SimulatorOnlyMixin, APIView):
         BreakerReading.objects.update_or_create(
             breaker=breaker,
             timestamp=timestamp,
-            defaults={'switch': switch, 'cur_power_mW': current.cur_power_mW},
+            defaults=current.as_sample(),
         )
         return Response({
             'organization': org.id,

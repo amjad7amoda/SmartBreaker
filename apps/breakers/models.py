@@ -91,8 +91,6 @@ class Breaker(models.Model):
 
     @property
     def label(self):
-        """What to call this breaker to a human. The name is optional, so anything
-        user-facing has to be able to fall back to the device id."""
         return self.name or self.device_id
 
     def __str__(self):
@@ -169,8 +167,23 @@ class BreakerStatus(models.Model):
     child_lock = models.BooleanField(default=False)
     cycle_time = models.CharField(max_length=100, blank=True, default='')
     online = models.BooleanField(default=False)
+    # False when Tuya would not tell us the device's scale/unit spec, so the
+    # measurements below are the device's own numbers rather than real units.
+    # Stored per row because it is only knowable at the moment of the read.
+    units_resolved = models.BooleanField(default=True)
     last_switched_on_at = models.DateTimeField(null=True, blank=True)
     reported_at = models.DateTimeField(auto_now=True)
+
+    # The half of a snapshot that is an observation rather than derived state.
+    # BreakerReading stores exactly these, so a historical sample and the
+    # current status describe a breaker in the same terms. last_switched_on_at
+    # is deliberately absent: it is a running summary of past samples, not
+    # something observed at one instant.
+    SAMPLE_FIELDS = (
+        'switch', 'online', 'child_lock', 'countdown_1_s',
+        'fault', 'relay_status', 'cycle_time', 'units_resolved',
+        'cur_current_mA', 'cur_power_mW', 'cur_voltage_mV',
+    )
 
     class Meta:
         verbose_name_plural = 'breaker statuses'
@@ -178,15 +191,35 @@ class BreakerStatus(models.Model):
     def __str__(self):
         return f'{self.breaker.device_id}: {"ON" if self.switch else "OFF"}'
 
+    def as_sample(self):
+        """This snapshot as BreakerReading field values."""
+        return {field: getattr(self, field) for field in self.SAMPLE_FIELDS}
+
 
 class BreakerReading(models.Model):
+    """One timestamped sample, carrying the same measurements as BreakerStatus.
+
+    Rows are written on every poll and aged out by ``purge_breaker_readings``,
+    so this is the history behind the single current-status row.
+    """
 
     breaker = models.ForeignKey(
         Breaker, on_delete=models.CASCADE, related_name='readings'
     )
     timestamp = models.DateTimeField()
     switch = models.BooleanField()
+    online = models.BooleanField(default=False)
+    child_lock = models.BooleanField(default=False)
+    countdown_1_s = models.PositiveIntegerField(default=0)
+    fault = models.CharField(max_length=100, blank=True, default='')
+    relay_status = models.CharField(
+        max_length=20, choices=BreakerStatus.RELAY_STATUS_CHOICES, default='last'
+    )
+    cycle_time = models.CharField(max_length=100, blank=True, default='')
+    units_resolved = models.BooleanField(default=True)
+    cur_current_mA = models.FloatField(null=True, blank=True)
     cur_power_mW = models.FloatField(null=True, blank=True)
+    cur_voltage_mV = models.FloatField(null=True, blank=True)
 
     class Meta:
         ordering = ['-timestamp']

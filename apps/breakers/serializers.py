@@ -5,6 +5,7 @@ from . import exceptions
 from .models import (
     Breaker,
     BreakerAction,
+    BreakerReading,
     BreakerStatus,
     TuyaCredential,
 )
@@ -265,6 +266,89 @@ class BreakerCreateSerializer(BreakerContractSerializer):
                 'Device is registered on Tuya but currently offline.'
             )
         return attrs
+
+
+def _from_milli(value):
+    """Devices report in mA/mW/mV; dashboards want A/W/V."""
+    return None if value is None else value / 1000
+
+
+class BreakerSnapshotSerializer(serializers.ModelSerializer):
+    """Shared shape of a stored breaker observation.
+
+    Deliberately mirrors what ``services.read_status`` returns for a live
+    device read — ``is_on``, ``countdown_s``, SI units — so a client can
+    consume a stored snapshot and a live one with the same code. The database
+    columns keep their own names (``switch``, ``countdown_1_s``, milli-units);
+    the translation to the API contract happens here, at the edge.
+    """
+
+    device_id = serializers.CharField(source='breaker.device_id', read_only=True)
+    name = serializers.CharField(source='breaker.name', read_only=True)
+    organization = serializers.IntegerField(
+        source='breaker.organization_id', read_only=True,
+    )
+    priority_type = serializers.CharField(
+        source='breaker.priority_type', read_only=True,
+    )
+    priority = serializers.IntegerField(
+        source='breaker.priority_degree', read_only=True,
+    )
+    type = serializers.CharField(source='breaker.load_type', read_only=True)
+
+    is_on = serializers.BooleanField(source='switch', read_only=True)
+    countdown_s = serializers.IntegerField(
+        source='countdown_1_s', read_only=True,
+    )
+    fault = serializers.SerializerMethodField()
+    voltage_V = serializers.SerializerMethodField()
+    current_A = serializers.SerializerMethodField()
+    power_W = serializers.SerializerMethodField()
+
+    SNAPSHOT_FIELDS = (
+        'device_id', 'name', 'organization',
+        'priority_type', 'priority', 'type',
+        'online', 'is_on', 'child_lock', 'countdown_s', 'fault',
+        'voltage_V', 'current_A', 'power_W', 'units_resolved',
+    )
+
+    @staticmethod
+    def get_fault(obj):
+        """Tuya's fault is a bitmask; we store it as text, '' meaning none."""
+        fault = (obj.fault or '').strip()
+        if not fault:
+            return 0
+        return int(fault) if fault.lstrip('-').isdigit() else fault
+
+    @staticmethod
+    def get_current_A(obj):
+        return _from_milli(obj.cur_current_mA)
+
+    @staticmethod
+    def get_power_W(obj):
+        return _from_milli(obj.cur_power_mW)
+
+    @staticmethod
+    def get_voltage_V(obj):
+        return _from_milli(obj.cur_voltage_mV)
+
+
+class BreakerStatusSerializer(BreakerSnapshotSerializer):
+
+    class Meta:
+        model = BreakerStatus
+        # reported_at is not part of the live-read shape, but a stored
+        # snapshot is worthless without saying how old it is.
+        fields = BreakerSnapshotSerializer.SNAPSHOT_FIELDS + ('reported_at',)
+        read_only_fields = fields
+
+
+class BreakerReadingSerializer(BreakerSnapshotSerializer):
+
+    class Meta:
+        model = BreakerReading
+        fields = BreakerSnapshotSerializer.SNAPSHOT_FIELDS + ('timestamp',)
+        read_only_fields = fields
 
 
 class BreakerStatusIngestItemSerializer(serializers.Serializer):

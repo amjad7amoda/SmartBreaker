@@ -65,6 +65,9 @@ class BreakerStatusAdmin(admin.ModelAdmin):
 
 @admin.register(BreakerReading)
 class BreakerReadingAdmin(admin.ModelAdmin):
-    list_display = ('breaker', 'timestamp', 'switch', 'cur_power_mW')
-    list_filter = ('switch',)
+    list_display = (
+        'breaker', 'timestamp', 'switch', 'online',
+        'cur_power_mW', 'cur_current_mA', 'cur_voltage_mV', 'fault',
+    )
+    list_filter = ('switch', 'online')
     search_fields = ('breaker__device_id',)

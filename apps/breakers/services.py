@@ -3,14 +3,20 @@ import time
 from datetime import timedelta
 
 from django.core.cache import cache
+from django.db import transaction
 from django.utils import timezone
 
 from apps.telemetry.models import Reading
 from apps.telemetry.serializers import ReadingSerializer
-
+from apps.kbs.models import Tier1SafetyState
 from apps.notifications.services import notify
-from . import scheduling
-from .models import BreakerAction, TuyaCredential
+
+from .models import (
+    BreakerAction,
+    BreakerReading,
+    BreakerStatus,
+    TuyaCredential,
+)
 from .tuya import TuyaClient, TuyaError
 
 SPEC_CACHE_TTL = 60 * 60 * 24
@@ -79,8 +85,6 @@ def latest_telemetry(organization_id):
     return ReadingSerializer(reading).data if reading else None
 
 def record_action(breaker, action, result, source, actor=None, reason=''):
-    """Preserve what the system saw at the moment it acted, so the decision can be
-    reconstructed later even after the telemetry it was based on has aged out."""
     return BreakerAction.objects.create(
         breaker=breaker,
         action=action,
@@ -94,14 +98,9 @@ def record_action(breaker, action, result, source, actor=None, reason=''):
 
 
 def tier1_interlock_reason(breaker, turn_on):
-    """Return a reason when Tier-1 currently forbids energizing this load."""
     if not turn_on or breaker.priority_type == 'ac_grid':
         return ''
-
-    # Lazy import prevents the breaker model/service layer from creating an
-    # import cycle with the KBS adapter.
-    from apps.kbs.models import Tier1SafetyState
-
+    
     safety = Tier1SafetyState.objects.filter(
         organization_id=breaker.organization_id,
         active=True,
@@ -321,6 +320,38 @@ def set_countdown(breaker, minutes, source='manual', actor=None, reason=''):
     )
 
 
+def milli(value):
+    """Tuya is read in base units; the status tables store milli-units."""
+    return None if value is None else value * 1000.0
+
+
+@transaction.atomic
+def persist_status(breaker, status):
+    observed_at = timezone.now().replace(microsecond=0)
+    current, _ = BreakerStatus.objects.select_for_update().get_or_create(breaker=breaker)
+
+    switch = current.switch if status['is_on'] is None else bool(status['is_on'])
+    if switch and not current.switch:
+        current.last_switched_on_at = observed_at
+    current.switch = switch
+    current.online = bool(status['online'])
+    current.child_lock = bool(status['child_lock'])
+    current.countdown_1_s = max(int(status['countdown_s'] or 0), 0)
+    current.fault = str(status['fault'] or '')[:100]
+    current.units_resolved = bool(status['units_resolved'])
+    current.cur_current_mA = milli(status['current_A'])
+    current.cur_power_mW = milli(status['power_W'])
+    current.cur_voltage_mV = milli(status['voltage_V'])
+    current.save()
+
+    BreakerReading.objects.get_or_create(
+        breaker=breaker,
+        timestamp=observed_at,
+        defaults=current.as_sample(),
+    )
+    return current
+
+
 def read_status(breaker, include_raw=False):
     client = client_for(breaker)
     result = client.get_device_properties(breaker.device_id)
@@ -343,6 +374,9 @@ def read_status(breaker, include_raw=False):
         'device_id': breaker.device_id,
         'name': breaker.name,
         'organization': breaker.organization_id,
+        'priorty_type': breaker.priority_type,
+        'priority': breaker.priority_degree,
+        'type': breaker.load_type,
         'online': properties.get('online_state') == 'online',
         'is_on': properties.get(SWITCH_READ_CODE),
         'child_lock': child_lock,
@@ -353,13 +387,7 @@ def read_status(breaker, include_raw=False):
         'power_W': power,
         'units_resolved': bool(specs),
     }
+    persist_status(breaker, status)
     if include_raw:
-        # Raw is a debugging aid and far bulkier than the rest; keep it out of the
-        # cache so a ?raw=1 call cannot poison what everyone else reads.
         status['raw'] = raw_properties
-    else:
-        # Caching here rather than in the poller means every fresh read refreshes the
-        # cache — including the read that follows a switch or a lock, which is what
-        # keeps a command from leaving a stale status behind it.
-        scheduling.cache_status(breaker.device_id, status)
     return status

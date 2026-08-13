@@ -1,17 +1,26 @@
-import json
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
-from django_celery_beat.models import PeriodicTask
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.organizations.models import Organization
 
-from . import scheduling
-from .models import Breaker, BreakerAction, TuyaCredential
-from .tasks import refresh_organization_breakers
+from .models import (
+    Breaker,
+    BreakerAction,
+    BreakerReading,
+    BreakerStatus,
+    TuyaCredential,
+)
+from .tasks import (
+    poll_all_breakers,
+    purge_breaker_readings,
+    refresh_organization_breakers,
+)
 
 User = get_user_model()
 
@@ -786,7 +795,7 @@ class ChildLockLockoutTests(APITestCase):
 
 
 class OrganizationPollingTests(APITestCase):
-    """The poller is created by traffic and torn down by silence."""
+    """The poller runs unconditionally and persists what it reads."""
 
     @classmethod
     def setUpTestData(cls):
@@ -797,82 +806,82 @@ class OrganizationPollingTests(APITestCase):
         credential = TuyaCredential(organization=cls.organization, client_id='cid11', region='us')
         credential.client_secret = 'secret'
         credential.save()
-        Breaker.objects.create(
+        cls.breaker = Breaker.objects.create(
             device_id=DEVICE_ID, organization=cls.organization, priority_degree=1
         )
 
     def setUp(self):
         cache.clear()
 
-    @property
-    def schedule(self):
-        return PeriodicTask.objects.get(name=scheduling.schedule_name(self.organization.id))
-
-    def test_first_authenticated_request_creates_the_organizations_poller(self):
-        self.assertEqual(PeriodicTask.objects.count(), 0)
-
-        self.client.force_authenticate(self.owner)
-        self.client.get('/api/breakers/')
-
-        task = self.schedule
-        self.assertTrue(task.enabled)
-        self.assertEqual(task.task, scheduling.TASK_NAME)
-        self.assertEqual(task.interval.every, 30)
-        self.assertEqual(task.interval.period, 'seconds')
-        self.assertEqual(json.loads(task.args), [self.organization.id])
-
-    def test_anonymous_traffic_starts_nothing(self):
-        self.client.get('/api/breakers/')
-        self.assertEqual(PeriodicTask.objects.count(), 0)
-
     @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
     @patch('apps.breakers.services.TuyaClient.get_device_properties', return_value=props(True))
-    def test_active_poller_caches_every_breaker_status(self, _p, _s):
-        scheduling.touch_organization(self.organization.id)
-
+    def test_poller_reports_what_it_refreshed(self, _p, _s):
         result = refresh_organization_breakers(self.organization.id)
 
         self.assertEqual(result['refreshed'], 1)
         self.assertEqual(result['failed'], 0)
-        self.assertTrue(scheduling.cached_status(DEVICE_ID)['is_on'])
-
-    def test_poller_switches_itself_off_once_the_organization_goes_idle(self):
-        scheduling.ensure_schedule(self.organization.id)  # no activity marker == idle
-
-        result = refresh_organization_breakers(self.organization.id)
-
-        self.assertEqual(result['stopped'], 'idle')
-        self.assertFalse(self.schedule.enabled)
-
-    def test_a_returning_user_restarts_a_stopped_poller(self):
-        scheduling.ensure_schedule(self.organization.id)
-        scheduling.disable_schedule(self.organization.id)
-        cache.clear()  # the re-check window has elapsed
-
-        self.client.force_authenticate(self.owner)
-        self.client.get('/api/breakers/')
-
-        self.assertTrue(self.schedule.enabled)
-
-    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
-    @patch('apps.breakers.services.TuyaClient.get_device_properties')
-    def test_status_endpoint_is_served_from_the_poller_cache(self, properties, _s):
-        scheduling.cache_status(DEVICE_ID, {'device_id': DEVICE_ID, 'is_on': True, 'from_cache': 1})
-
-        self.client.force_authenticate(self.owner)
-        body = self.client.get(f'/api/breakers/{DEVICE_ID}/status/').json()
-
-        self.assertEqual(body['from_cache'], 1)
-        properties.assert_not_called()
 
     @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
     @patch('apps.breakers.services.TuyaClient.get_device_properties', return_value=props(True))
-    def test_raw_requests_bypass_the_cache_and_do_not_poison_it(self, _p, _s):
+    def test_poller_persists_the_rows_the_kbs_adapter_reads(self, _p, _s):
+        refresh_organization_breakers(self.organization.id)
+
+        current = BreakerStatus.objects.get(breaker=self.breaker)
+        self.assertTrue(current.switch)
+        self.assertTrue(current.online)
+        self.assertIsNotNone(current.last_switched_on_at)
+        reading = BreakerReading.objects.get(breaker=self.breaker)
+        self.assertTrue(reading.switch)
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties',
+           return_value=LIVE_PROPERTIES)
+    def test_persisted_status_is_scaled_into_milli_units(self, _p, _s):
+        refresh_organization_breakers(self.organization.id)
+
+        current = BreakerStatus.objects.get(breaker=self.breaker)
+        self.assertAlmostEqual(current.cur_voltage_mV, 213000.0)   # 2130 -> 213.0 V
+        self.assertAlmostEqual(current.cur_power_mW, 958700.0)     # 9587 -> 958.7 W
+        self.assertAlmostEqual(current.cur_current_mA, 4500.0)     # 4500 mA -> 4.5 A
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties', return_value=props(True))
+    def test_polling_fans_out_only_to_sites_with_credentials(self, properties, _s):
+        stranger = make_user('nocred@example.com', 'home_user')
+        uncredentialed = Organization.objects.create(
+            name='Site L', phone='12', latitude=0, longitude=0,
+            owner=stranger, status='active',
+        )
+        Breaker.objects.create(
+            device_id='no-credential-device', organization=uncredentialed,
+            priority_degree=1,
+        )
+
+        result = poll_all_breakers()
+
+        self.assertEqual(result['organizations'], 1)
+        self.assertEqual(properties.call_count, 1)
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties', return_value=props(True))
+    def test_every_status_request_reaches_the_device(self, properties, _s):
+        """No cache sits in front of the endpoint: a poll never serves a read."""
+        refresh_organization_breakers(self.organization.id)
+        self.client.force_authenticate(self.owner)
+
+        self.client.get(f'/api/breakers/{DEVICE_ID}/status/')
+        self.client.get(f'/api/breakers/{DEVICE_ID}/status/')
+
+        self.assertEqual(properties.call_count, 3)  # one poll + two reads
+
+    @patch('apps.breakers.services.TuyaClient.get_device_specification', return_value=SPEC)
+    @patch('apps.breakers.services.TuyaClient.get_device_properties', return_value=props(True))
+    def test_raw_requests_still_persist_the_status_row(self, _p, _s):
         self.client.force_authenticate(self.owner)
         body = self.client.get(f'/api/breakers/{DEVICE_ID}/status/?raw=1').json()
 
         self.assertIn('raw', body)
-        self.assertIsNone(scheduling.cached_status(DEVICE_ID))
+        self.assertTrue(BreakerStatus.objects.get(breaker=self.breaker).switch)
 
 
 class SimulatorStatusIngestTests(APITestCase):
@@ -932,6 +941,20 @@ class SimulatorStatusIngestTests(APITestCase):
             BreakerReading.objects.filter(breaker=self.breaker).exists()
         )
 
+    def test_ingested_history_row_mirrors_the_status_row(self):
+        self.client.post('/api/breakers/status/', self.payload(), format='json')
+
+        current = BreakerStatus.objects.get(breaker=self.breaker)
+        sample = BreakerReading.objects.get(breaker=self.breaker)
+
+        for field in BreakerStatus.SAMPLE_FIELDS:
+            self.assertEqual(
+                getattr(sample, field), getattr(current, field), msg=field,
+            )
+        self.assertEqual(sample.cur_current_mA, 3500)
+        self.assertEqual(sample.cur_voltage_mV, 250000)
+        self.assertTrue(sample.child_lock)
+
     def test_replayed_timestamp_is_idempotent(self):
         from .models import BreakerReading
 
@@ -963,3 +986,288 @@ class SimulatorStatusIngestTests(APITestCase):
             '/api/breakers/status/', self.payload() * 2, format='json'
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class BreakerReadingRetentionTests(APITestCase):
+    """Readings age out; current state does not."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.owner = make_user('retention@example.com', 'home_user')
+        cls.organization = Organization.objects.create(
+            name='Site M', phone='13', latitude=0, longitude=0,
+            owner=cls.owner, status='active',
+        )
+        cls.breaker = Breaker.objects.create(
+            device_id='retention-device', organization=cls.organization,
+            priority_degree=1,
+        )
+
+    def reading(self, minutes_ago):
+        return BreakerReading.objects.create(
+            breaker=self.breaker,
+            timestamp=timezone.now() - timedelta(minutes=minutes_ago),
+            switch=True,
+            cur_power_mW=1000.0,
+        )
+
+    def test_readings_past_the_window_are_deleted(self):
+        stale = self.reading(90)
+        fresh = self.reading(30)
+
+        result = purge_breaker_readings()
+
+        self.assertEqual(result['deleted'], 1)
+        self.assertFalse(BreakerReading.objects.filter(pk=stale.pk).exists())
+        self.assertTrue(BreakerReading.objects.filter(pk=fresh.pk).exists())
+
+    def test_purging_readings_leaves_current_state_alone(self):
+        BreakerStatus.objects.create(breaker=self.breaker, switch=True, online=True)
+        self.reading(120)
+
+        purge_breaker_readings()
+
+        self.assertTrue(BreakerStatus.objects.get(breaker=self.breaker).switch)
+
+
+class StoredStatusReadTests(APITestCase):
+    """Reading back what was ingested, without ever calling Tuya."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.owner = make_user('reader@example.com', 'home_user')
+        cls.stranger = make_user('stranger@example.com', 'home_user')
+        cls.technician = make_user('reader-tech@example.com', 'technician')
+
+        cls.organization = Organization.objects.create(
+            name='Site N', phone='14', latitude=0, longitude=0,
+            owner=cls.owner, status='active',
+        )
+        cls.other_organization = Organization.objects.create(
+            name='Site O', phone='15', latitude=0, longitude=0,
+            owner=cls.stranger, status='active',
+        )
+        cls.breaker = Breaker.objects.create(
+            device_id='read-device', name='Heater1',
+            organization=cls.organization, priority_degree=1,
+            priority_type='normal', load_type='motor',
+        )
+        cls.other_breaker = Breaker.objects.create(
+            device_id='read-device-other',
+            organization=cls.other_organization, priority_degree=1,
+        )
+        BreakerStatus.objects.create(
+            breaker=cls.breaker, switch=True, online=True,
+            cur_current_mA=133, cur_power_mW=22800, cur_voltage_mV=204200,
+        )
+        BreakerStatus.objects.create(
+            breaker=cls.other_breaker, switch=False, online=True,
+        )
+
+    def test_stored_status_matches_the_live_read_contract(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.get('/api/breakers/statuses/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = response.json()
+        self.assertEqual(len(body), 1)
+        row = body[0]
+        self.assertEqual(row.pop('reported_at')[:4], '2026')
+        self.assertEqual(row, {
+            'device_id': 'read-device',
+            'name': 'Heater1',
+            'organization': self.organization.id,
+            'priority_type': 'normal',
+            'priority': 1,
+            'type': 'motor',
+            'online': True,
+            'is_on': True,
+            'child_lock': False,
+            'countdown_s': 0,
+            'fault': 0,
+            'voltage_V': 204.2,
+            'current_A': 0.133,
+            'power_W': 22.8,
+            'units_resolved': True,
+        })
+
+    def test_milli_unit_columns_are_not_exposed(self):
+        self.client.force_authenticate(self.owner)
+        row = self.client.get('/api/breakers/statuses/').json()[0]
+
+        for column in ('cur_power_mW', 'cur_current_mA', 'cur_voltage_mV'):
+            self.assertNotIn(column, row)
+        self.assertNotIn('switch', row)          # it is called is_on now
+        self.assertNotIn('countdown_1_s', row)   # ... and countdown_s
+
+    def test_unresolved_units_are_reported_per_row(self):
+        BreakerStatus.objects.filter(breaker=self.breaker).update(
+            units_resolved=False,
+        )
+        self.client.force_authenticate(self.owner)
+
+        row = self.client.get('/api/breakers/statuses/').json()[0]
+
+        self.assertFalse(row['units_resolved'])
+
+    def test_a_fault_code_survives_as_a_number(self):
+        BreakerStatus.objects.filter(breaker=self.breaker).update(fault='2')
+        self.client.force_authenticate(self.owner)
+
+        row = self.client.get('/api/breakers/statuses/').json()[0]
+
+        self.assertEqual(row['fault'], 2)
+
+    def test_is_on_filters_the_list(self):
+        self.client.force_authenticate(self.technician)
+
+        on = self.client.get('/api/breakers/statuses/?is_on=true').json()
+        off = self.client.get('/api/breakers/statuses/?is_on=false').json()
+
+        self.assertEqual([r['device_id'] for r in on], ['read-device'])
+        self.assertEqual([r['device_id'] for r in off], ['read-device-other'])
+
+    def test_status_list_is_scoped_to_the_callers_organizations(self):
+        self.client.force_authenticate(self.owner)
+        listed = [r['device_id'] for r in self.client.get('/api/breakers/statuses/').json()]
+        self.assertEqual(listed, ['read-device'])
+
+        self.client.force_authenticate(self.technician)
+        self.assertEqual(len(self.client.get('/api/breakers/statuses/').json()), 2)
+
+    def test_status_detail_hides_other_organizations_behind_a_404(self):
+        self.client.force_authenticate(self.owner)
+
+        mine = self.client.get('/api/breakers/statuses/read-device/')
+        self.assertEqual(mine.status_code, status.HTTP_200_OK)
+        self.assertEqual(mine.json()['device_id'], 'read-device')
+
+        theirs = self.client.get('/api/breakers/statuses/read-device-other/')
+        self.assertEqual(theirs.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_status_list_requires_authentication(self):
+        self.assertEqual(
+            self.client.get('/api/breakers/statuses/').status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+
+class BreakerReadingReadTests(APITestCase):
+    """The per-breaker sample history endpoints."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.owner = make_user('history@example.com', 'home_user')
+        cls.stranger = make_user('history-stranger@example.com', 'home_user')
+        cls.organization = Organization.objects.create(
+            name='Site P', phone='16', latitude=0, longitude=0,
+            owner=cls.owner, status='active',
+        )
+        cls.other_organization = Organization.objects.create(
+            name='Site Q', phone='17', latitude=0, longitude=0,
+            owner=cls.stranger, status='active',
+        )
+        cls.breaker = Breaker.objects.create(
+            device_id='history-device', organization=cls.organization,
+            priority_degree=1,
+        )
+        cls.other_breaker = Breaker.objects.create(
+            device_id='history-device-other',
+            organization=cls.other_organization, priority_degree=1,
+        )
+        cls.now = timezone.now().replace(microsecond=0)
+        for minutes in (30, 20, 10):
+            BreakerReading.objects.create(
+                breaker=cls.breaker,
+                timestamp=cls.now - timedelta(minutes=minutes),
+                switch=True, online=True, child_lock=False,
+                countdown_1_s=minutes, fault='', relay_status='power_on',
+                cycle_time='',
+                cur_current_mA=minutes * 100.0,
+                cur_power_mW=minutes * 1000.0,
+                cur_voltage_mV=230000.0,
+            )
+        BreakerReading.objects.create(
+            breaker=cls.other_breaker, timestamp=cls.now,
+            switch=False, cur_power_mW=0.0,
+        )
+
+    def test_history_is_paginated_and_newest_first(self):
+        self.client.force_authenticate(self.owner)
+        body = self.client.get('/api/breakers/history-device/readings/').json()
+
+        self.assertEqual(body['count'], 3)
+        timestamps = [row['timestamp'] for row in body['results']]
+        self.assertEqual(timestamps, sorted(timestamps, reverse=True))
+        self.assertEqual(body['results'][0]['power_W'], 10.0)
+
+    def test_a_sample_carries_the_whole_snapshot_not_just_power(self):
+        self.client.force_authenticate(self.owner)
+        row = self.client.get(
+            '/api/breakers/history-device/readings/',
+        ).json()['results'][0]
+
+        self.assertEqual(row.pop('timestamp')[:4], '2026')
+        self.assertEqual(row, {
+            'device_id': 'history-device',
+            'name': '',
+            'organization': self.organization.id,
+            'priority_type': 'normal',
+            'priority': 1,
+            'type': 'normal',
+            'online': True,
+            'is_on': True,
+            'child_lock': False,
+            'countdown_s': 10,
+            'fault': 0,
+            'voltage_V': 230.0,
+            'current_A': 1.0,
+            'power_W': 10.0,
+            'units_resolved': True,
+        })
+
+    def test_a_sample_and_a_current_status_share_one_shape(self):
+        """The two endpoints differ only in which timestamp they carry."""
+        BreakerStatus.objects.create(breaker=self.breaker, switch=True)
+        self.client.force_authenticate(self.owner)
+
+        sample = self.client.get(
+            '/api/breakers/history-device/readings/',
+        ).json()['results'][0]
+        current = self.client.get('/api/breakers/statuses/history-device/').json()
+
+        self.assertEqual(set(sample) - {'timestamp'}, set(current) - {'reported_at'})
+
+    def test_history_of_an_unreachable_breaker_is_a_404(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.get('/api/breakers/history-device-other/readings/')
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_time_window_narrows_the_history(self):
+        self.client.force_authenticate(self.owner)
+        since = (self.now - timedelta(minutes=25)).isoformat()
+
+        body = self.client.get(
+            '/api/breakers/history-device/readings/', {'since': since},
+        ).json()
+
+        self.assertEqual(body['count'], 2)
+
+    def test_unparseable_time_window_is_rejected(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.get(
+            '/api/breakers/history-device/readings/', {'since': 'yesterday'},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('since', response.json())
+
+    def test_flat_history_endpoint_covers_every_breaker_in_scope(self):
+        self.client.force_authenticate(self.owner)
+
+        body = self.client.get('/api/breakers/readings/').json()
+        self.assertEqual(body['count'], 3)
+
+        filtered = self.client.get(
+            '/api/breakers/readings/', {'device_id': 'history-device-other'},
+        ).json()
+        self.assertEqual(filtered['count'], 0)

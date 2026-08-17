@@ -3,6 +3,7 @@
 **.idea
 **.env
 **venv**
+**.vscode**
 
 # Local service/runtime state
 celerybeat-schedule*

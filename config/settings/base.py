@@ -203,3 +203,13 @@ CELERY_BEAT_SCHEDULE = {
     #     'schedule': 60.0,
     # },
 }
+
+ALLOWED_HOSTS = [
+    "happier-professor-aids.ngrok-free.dev",
+    "localhost",
+    "127.0.0.1"
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    "https://happier-professor-aids.ngrok-free.dev",
+]
